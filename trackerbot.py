@@ -21,8 +21,10 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import traceback
+import weakref
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +41,8 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -50,6 +54,7 @@ from aiogram.types import (
     Message,
     TelegramObject,
 )
+from tracker_ui import build_screen, deliver, register_ui, short, stats_card
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -65,6 +70,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # ============================================================
@@ -262,6 +268,16 @@ Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 # ============================================================
 router = Router()
 WRITE_LAST: dict[int, float] = {}
+USER_WRITE_LOCKS: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def user_write_lock(uid: int) -> asyncio.Lock:
+    """Serialize confirmed actions for a target, even from different admins."""
+    lock = USER_WRITE_LOCKS.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        USER_WRITE_LOCKS[uid] = lock
+    return lock
 
 LOOP_EXTS = {
     ".mp3",
@@ -292,18 +308,9 @@ SORT_KEYS = {
 PERIOD_KEYS = {"7d", "30d", "month", "all"}
 
 MONTHS_EN = {
-    1: "Jan",
-    2: "Feb",
-    3: "Mar",
-    4: "Apr",
-    5: "May",
-    6: "Jun",
-    7: "Jul",
-    8: "Aug",
-    9: "Sep",
-    10: "Oct",
-    11: "Nov",
-    12: "Dec",
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
 }
 
 EMPTY_STATS = {
@@ -424,7 +431,10 @@ def contains_opportunity_tag(message: Message) -> bool:
     if not OPPORTUNITY_TAGS:
         return False
     haystack = f"{message.text or ''}\n{message.caption or ''}".lower()
-    return any(tag in haystack for tag in OPPORTUNITY_TAGS)
+    return any(
+        re.search(r"(?<!\w)" + re.escape(tag) + r"(?!\w)", haystack)
+        for tag in OPPORTUNITY_TAGS
+    )
 
 
 # ============================================================
@@ -498,9 +508,11 @@ def get_category(message: Message) -> str | None:
             return "zip"
         # other documents (pdf, txt, project files, etc.)
         return "files"
-    if message.audio or message.voice or message.video_note:
+    if message.audio:
         return "loop"
-    if message.photo or message.video or message.animation:
+    if message.voice:
+        return "message"
+    if message.photo or message.video or message.animation or message.video_note:
         return "media"
     if message.text:
         return "message"
@@ -694,6 +706,34 @@ async def upsert_user(
     last_name: str | None = None,
 ) -> None:
     now = utc_now()
+    # A username can be removed or transferred to another Telegram ID.
+    if username:
+        await session.execute(
+            update(User)
+            .where(User.user_id != user_id, func.lower(User.username) == username.lower())
+            .values(username=None)
+        )
+    if session.get_bind().dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+
+        stmt = insert(User).values(
+            user_id=user_id, username=username, first_name=first_name,
+            last_name=last_name, first_seen=now, last_seen=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[User.user_id],
+            set_={
+                "username": stmt.excluded.username,
+                "first_name": stmt.excluded.first_name,
+                "last_name": stmt.excluded.last_name,
+                "last_seen": stmt.excluded.last_seen,
+            },
+        ).returning(User)
+        # Atomic insert/update prevents concurrent first messages losing a log
+        # to a users-PK collision; refresh identities already loaded in session.
+        result = await session.scalars(stmt, execution_options={"populate_existing": True})
+        result.all()
+        return
     existing = await session.get(User, user_id)
     if existing is None:
         session.add(
@@ -707,10 +747,9 @@ async def upsert_user(
             )
         )
     else:
-        existing.username = username or existing.username
-        existing.first_name = first_name or existing.first_name
-        if last_name is not None:
-            existing.last_name = last_name
+        existing.username = username
+        existing.first_name = first_name
+        existing.last_name = last_name
         existing.last_seen = now
 
 
@@ -739,6 +778,8 @@ async def track_message(session: AsyncSession, message: Message) -> None:
         message.from_user.last_name,
     )
 
+    # Updates can be queued across day/month boundaries while the bot is down.
+    created_at = message.date.astimezone(timezone.utc).replace(tzinfo=None)
     row = MsgLog(
         message_id=message.message_id,
         user_id=message.from_user.id,
@@ -749,13 +790,25 @@ async def track_message(session: AsyncSession, message: Message) -> None:
         category=category,
         opportunity=contains_opportunity_tag(message),
         text_preview=get_text_preview(message),
-        created_at=utc_now(),
+        created_at=created_at,
     )
-    session.add(row)
+    try:
+        # Roll back only a duplicate log, preserving fresh user metadata.
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        duplicate = await session.scalar(
+            select(MsgLog.id).where(
+                MsgLog.chat_id == message.chat.id,
+                MsgLog.message_id == message.message_id,
+            )
+        )
+        if duplicate is None:
+            await session.rollback()
+            raise
     try:
         await session.commit()
-    except IntegrityError:
-        await session.rollback()
     except Exception:
         await session.rollback()
         log.exception(
@@ -769,8 +822,17 @@ class DatabaseMiddleware(BaseMiddleware):
             data["session"] = session
             if isinstance(event, Message):
                 try:
+                    if is_command_message(event) and event.from_user and not event.from_user.is_bot:
+                        if state := data.get("state"):
+                            await state.clear()
+                        await upsert_user(
+                            session, event.from_user.id, event.from_user.username,
+                            event.from_user.first_name, event.from_user.last_name,
+                        )
+                        await session.commit()
                     await track_message(session, event)
                 except Exception:
+                    await session.rollback()
                     log.exception("Tracking middleware failed")
             return await handler(event, data)
 
@@ -804,7 +866,7 @@ async def resolve_name(session: AsyncSession, uid: int) -> str | None:
     )
     username = result.scalar_one_or_none()
     if username:
-        return display_name(username, None)
+        return username if username.startswith("@") else display_name(username, None)
 
     result = await session.execute(
         select(Note.username)
@@ -814,25 +876,18 @@ async def resolve_name(session: AsyncSession, uid: int) -> str | None:
     )
     username = result.scalar_one_or_none()
     if username:
-        return display_name(username, None)
+        return username if username.startswith("@") else display_name(username, None)
     return None
 
 
 async def find_user(session: AsyncSession, message: Message, raw: str | None):
+    raw = raw.strip() if raw else None
     if not raw and message.reply_to_message and message.reply_to_message.from_user:
         user = message.reply_to_message.from_user
-        await upsert_user(
-            session,
-            user.id,
-            user.username,
-            user.first_name,
-            user.last_name,
-        )
-        try:
-            await session.commit()
-        except Exception:
-            await session.rollback()
-        return user.id, display_name(user.username, user.first_name), None
+        # Resolving a reply is a read operation. Its embedded user profile may
+        # also be older than the latest tracked profile.
+        name = await resolve_name(session, user.id)
+        return user.id, name or display_name(user.username, user.first_name), None
 
     if not raw:
         return None, None, "💡 Укажи @username или ответь командой на сообщение пользователя."
@@ -840,20 +895,26 @@ async def find_user(session: AsyncSession, message: Message, raw: str | None):
     arg = raw.strip().lstrip("@")
     if arg.isdigit():
         uid = int(arg)
+        if not 0 < uid < 2**63:
+            return None, None, "Укажи положительный Telegram ID (до 19 цифр)."
         name = await resolve_name(session, uid)
         return uid, name or f"ID {uid}", None
 
     # Exact username from users table first
     exact_user = await session.execute(
-        select(User).where(func.lower(User.username) == arg.lower()).limit(1)
+        select(User).where(func.lower(User.username) == arg.lower()).limit(2)
     )
-    urow = exact_user.scalar_one_or_none()
-    if urow:
+    exact_users = exact_user.scalars().all()
+    if len(exact_users) > 1:
+        return None, None, "🤔 Username неоднозначен. Ответь на сообщение пользователя или укажи Telegram ID."
+    if exact_users:
+        urow = exact_users[0]
         return urow.user_id, display_name(urow.username, urow.first_name), None
 
     exact = await session.execute(
         select(MsgLog.user_id, MsgLog.username, MsgLog.first_name)
-        .where(func.lower(MsgLog.username) == arg.lower())
+        .outerjoin(User, User.user_id == MsgLog.user_id)
+        .where(User.user_id.is_(None), func.lower(MsgLog.username) == arg.lower())
         .order_by(MsgLog.created_at.desc())
         .limit(1)
     )
@@ -861,7 +922,10 @@ async def find_user(session: AsyncSession, message: Message, raw: str | None):
     if row:
         return row.user_id, display_name(row.username, row.first_name), None
 
-    escaped = arg.lower().replace("%", "\\%").replace("_", "\\_")
+    if raw.strip().startswith("@"):
+        return None, None, "❌ Пользователь не найден. Попробуй ответом на его сообщение или укажи Telegram ID."
+
+    escaped = arg.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
 
     # Prefer users table for fuzzy
@@ -885,23 +949,28 @@ async def find_user(session: AsyncSession, message: Message, raw: str | None):
         return None, None, f"🤔 Нашёл несколько пользователей: {names}"
 
     result = await session.execute(
-        select(MsgLog.user_id, MsgLog.username, MsgLog.first_name)
+        select(MsgLog.user_id)
+        .outerjoin(User, User.user_id == MsgLog.user_id)
         .where(
+            User.user_id.is_(None),
             or_(
                 func.lower(MsgLog.username).like(pattern, escape="\\"),
                 func.lower(MsgLog.first_name).like(pattern, escape="\\"),
             )
         )
-        .group_by(MsgLog.user_id, MsgLog.username, MsgLog.first_name)
+        .group_by(MsgLog.user_id)
         .order_by(func.max(MsgLog.created_at).desc())
         .limit(5)
     )
     rows = result.fetchall()
     if len(rows) == 1:
         r = rows[0]
-        return r.user_id, display_name(r.username, r.first_name), None
+        return r.user_id, await resolve_name(session, r.user_id), None
     if len(rows) > 1:
-        names = ", ".join(escape_html(display_name(r.username, r.first_name)) for r in rows)
+        names = ", ".join([
+            escape_html(await resolve_name(session, r.user_id) or f"ID {r.user_id}")
+            for r in rows
+        ])
         return None, None, f"🤔 Нашёл несколько пользователей: {names}"
     return None, None, "❌ Пользователь не найден. Попробуй ответом на его сообщение или укажи Telegram ID."
 
@@ -929,7 +998,8 @@ def _blank_user(username=None, first_name=None) -> dict:
 
 
 async def user_pivot(
-    session: AsyncSession, start: datetime | None, end: datetime | None
+    session: AsyncSession, start: datetime | None, end: datetime | None,
+    *, user_id: int | None = None,
 ) -> dict[int, dict]:
     q = select(
         MsgLog.user_id,
@@ -938,6 +1008,10 @@ async def user_pivot(
         MsgLog.category,
         func.count(MsgLog.id),
     )
+    if user_id is not None:
+        q = q.where(MsgLog.user_id == user_id)
+    if TRACK_CHAT_ID is not None:
+        q = q.where(MsgLog.chat_id == TRACK_CHAT_ID)
     if start is not None:
         q = q.where(MsgLog.created_at >= start)
     if end is not None:
@@ -963,6 +1037,10 @@ async def user_pivot(
         user["total"] += count
 
     opp_q = select(MsgLog.user_id, func.count(MsgLog.id)).where(MsgLog.opportunity.is_(True))
+    if user_id is not None:
+        opp_q = opp_q.where(MsgLog.user_id == user_id)
+    if TRACK_CHAT_ID is not None:
+        opp_q = opp_q.where(MsgLog.chat_id == TRACK_CHAT_ID)
     if start is not None:
         opp_q = opp_q.where(MsgLog.created_at >= start)
     if end is not None:
@@ -970,11 +1048,18 @@ async def user_pivot(
     opp_q = opp_q.group_by(MsgLog.user_id)
     for uid, count in (await session.execute(opp_q)).fetchall():
         users.setdefault(uid, _blank_user())["opportunities"] = count
+    if users:
+        profiles = await session.execute(
+            select(User.user_id, User.username, User.first_name).where(User.user_id.in_(users))
+        )
+        for uid, username, first_name in profiles:
+            users[uid].update(un=username, fn=first_name)
     return users
 
 
 async def user_days(
-    session: AsyncSession, start: datetime | None, end: datetime | None
+    session: AsyncSession, start: datetime | None, end: datetime | None,
+    *, user_id: int | None = None,
 ) -> dict[int, int]:
     """Count distinct local calendar days per user.
 
@@ -982,6 +1067,10 @@ async def user_days(
     Indexed by (user_id, created_at) so this stays acceptable for typical private-group volumes.
     """
     q = select(MsgLog.user_id, MsgLog.created_at)
+    if user_id is not None:
+        q = q.where(MsgLog.user_id == user_id)
+    if TRACK_CHAT_ID is not None:
+        q = q.where(MsgLog.chat_id == TRACK_CHAT_ID)
     if start is not None:
         q = q.where(MsgLog.created_at >= start)
     if end is not None:
@@ -997,6 +1086,8 @@ async def get_user_dates(
     session: AsyncSession, uid: int, start: datetime | None, end: datetime | None
 ) -> list[date]:
     q = select(MsgLog.created_at).where(MsgLog.user_id == uid)
+    if TRACK_CHAT_ID is not None:
+        q = q.where(MsgLog.chat_id == TRACK_CHAT_ID)
     if start is not None:
         q = q.where(MsgLog.created_at >= start)
     if end is not None:
@@ -1104,6 +1195,23 @@ async def placement_progress(session: AsyncSession, uid: int) -> dict:
 async def reset_placement_progress(
     session: AsyncSession, uid: int, kind: str, actor_id: int | None, name: str | None
 ) -> dict:
+    async with user_write_lock(uid):
+        # End earlier read snapshots; a second admin must see the first reset.
+        await session.commit()
+        state = await session.get(PlacementProgress, uid)
+        if state is not None:
+            await session.refresh(state)
+        p = await placement_progress(session, uid)
+        if kind not in {"small", "big"}:
+            raise ValueError("Укажи Small или Big.")
+        if not p["ready_small" if kind == "small" else "ready_big"]:
+            raise ValueError("Порог этой роли ещё не достигнут или роль уже подтверждена.")
+        return await _reset_placement_progress(session, uid, kind, actor_id, name)
+
+
+async def _reset_placement_progress(
+    session: AsyncSession, uid: int, kind: str, actor_id: int | None, name: str | None
+) -> dict:
     state = await get_or_create_placement_progress(session, uid)
     now = utc_now()
     p_before = await placement_progress(session, uid)
@@ -1137,10 +1245,14 @@ async def get_user_stats(
     session: AsyncSession, uid: int, period: str, include_placements: bool = False
 ) -> dict:
     start, end, label = period_bounds(period)
-    users = await user_pivot(session, start, end)
-    days = await user_days(session, start, end)
-    dates = await get_user_dates(session, uid, None, None)
+    users = await user_pivot(session, start, end, user_id=uid)
+    days = await user_days(session, start, end, user_id=uid)
+    dates = await get_user_dates(session, uid, None, utc_now())
     base = users.get(uid, _blank_user()).copy()
+    if uid not in users:
+        profile = await session.get(User, uid)
+        if profile:
+            base.update(un=profile.username, fn=profile.first_name)
     base["active_days"] = days.get(uid, 0)
     base["streak"] = calc_streak(dates)
     base["period_label"] = label
@@ -1168,27 +1280,7 @@ async def build_stats_text(
         name = await resolve_name(session, uid) or f"ID {uid}"
     s = await get_user_stats(session, uid, period)
 
-    rows = [
-        ("✏️ Messages", s["messages"]),
-        ("🎵 Loops", s["loops"]),
-        ("🗂 Zips", s["zips"]),
-        ("📎 Files", s["files"]),
-        ("🖼 Media", s["media"]),
-        ("🎯 Opps", s["opportunities"]),
-    ]
-    body = "\n".join(f"{label}　　<b>{value}</b>" for label, value in rows)
-    out = (
-        f"📊 <b>{escape_html(name)}</b>\n"
-        f"<i>{escape_html(s['period_label'])}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💬 <b>Total　　{s['total']}</b>\n\n"
-        f"{body}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Days <b>{s['active_days']}</b>　·　🔥 Streak <b>{s['streak']}</b>"
-    )
-    if hints:
-        out += "\n\n<i>/places · /roles · /profile</i>"
-    return out
+    return stats_card(name, s)
 
 
 async def build_top(session: AsyncSession, sort: str, period: str) -> str:
@@ -1204,6 +1296,9 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
         # stable tie-breakers
         return (primary, user.get("total", 0), user.get("loops", 0), uid)
 
+    users = {uid: user for uid, user in users.items() if (days.get(uid, 0) if sort == "days" else user.get(sort, 0)) > 0}
+    if not users:
+        return f"🏆 <b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности в этой категории."
     current = sorted(users.items(), key=sort_key, reverse=True)[:10]
     arrows: dict[int, str] = {}
     if period in {"7d", "30d"}:
@@ -1218,6 +1313,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
             primary = prev_days.get(uid, 0) if sort == "days" else user.get(sort, 0)
             return (primary, user.get("total", 0), user.get("loops", 0), uid)
 
+        prev_users = {uid: user for uid, user in prev_users.items() if (prev_days.get(uid, 0) if sort == "days" else user.get(sort, 0)) > 0}
         prev_rank = {
             uid: idx
             for idx, (uid, _) in enumerate(
@@ -1229,20 +1325,15 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
             arrows[uid] = "🆕" if prev is None else "↑" if prev > idx else "↓" if prev < idx else "•"
 
     labels = {
-        "total": "Total",
-        "messages": "Messages",
-        "loops": "Loops",
-        "zips": "Zips",
-        "files": "Files",
-        "media": "Photo/Video",
-        "days": "Active days",
-        "opportunities": "Opportunities",
+        "total": "Вся активность", "messages": "Сообщения",
+        "loops": "Лупы", "zips": "Архивы", "files": "Файлы",
+        "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности",
     }
     medals = ["🥇", "🥈", "🥉"]
-    out = f"{header('🏆', f'TOP · {labels.get(sort, sort)}')}\n<i>{escape_html(label)}</i>\n\n"
+    out = f"{header('🏆', f'Рейтинг · {labels.get(sort, sort)}')}\n<i>{escape_html(label)}</i>\n\n"
     for idx, (uid, user) in enumerate(current, start=1):
         marker = medals[idx - 1] if idx <= 3 else f"{idx}."
-        name = escape_html(display_name(user["un"], user["fn"]))
+        name = escape_html(short(display_name(user["un"], user["fn"]), 55))
         value = days.get(uid, 0) if sort == "days" else user.get(sort, 0)
         out += f"{marker} {name} — <b>{value}</b> {arrows.get(uid, '')}\n"
     return out
@@ -1254,8 +1345,8 @@ async def build_activity_candidates(session: AsyncSession) -> str:
     days = await user_days(session, start, end)
     if not users:
         return (
-            "🎖 <b>Activity candidates</b>\n"
-            "<i>Last 30 days</i>\n\n"
+            "🌟 <b>Активные участники</b>\n"
+            "<i>Последние 30 дней</i>\n\n"
             "Нет активности за последние 30 дней."
         )
 
@@ -1279,9 +1370,11 @@ async def build_activity_candidates(session: AsyncSession) -> str:
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for idx, (uid, u) in enumerate(ranked):
-        name = escape_html(display_name(u["un"], u["fn"]))
-        lines.append(f"{medals[idx]} <b>{name}</b>")
-    out = "🎖 <b>Top activity</b> · <i>30 days</i>\n\n" + "\n".join(lines)
+        name = escape_html(short(display_name(u["un"], u["fn"]), 55))
+        points = score(uid, u)[0]
+        lines.append(f"{medals[idx]} <b>{name}</b> · {points:g} баллов\n{u['total']} действий · {days.get(uid, 0)} активных дней")
+    out = "🌟 <b>Активные участники</b>\n<i>Последние 30 дней</i>\n\n" + "\n\n".join(lines)
+    out += "\n\n<i>Баллы: луп 3 · архив 2 · файл 1,5 · возможность 2 · медиа 1 · сообщение 0,25 · активный день 1. Возможность — дополнительный признак сообщения.</i>"
     return out
 
 async def build_last_text(session: AsyncSession, uid: int, name: str | None) -> str:
@@ -1559,7 +1652,7 @@ async def build_weekly_report(session: AsyncSession) -> str | None:
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"{header('🏆', 'Weekly report')}\n<i>{label}</i>\n\nНет активности."
+        return f"{header('📋', 'Отчёт за неделю')}\n<i>{label}</i>\n\nЗа этот период ещё нет активности."
 
     ranked = sorted(users.items(), key=lambda item: item[1]["total"], reverse=True)[:10]
     loop_leader = max(users.items(), key=lambda item: item[1]["loops"])
@@ -1570,35 +1663,35 @@ async def build_weekly_report(session: AsyncSession) -> str | None:
     opp_leader = max(users.items(), key=lambda item: item[1]["opportunities"])
 
     medals = ["🥇", "🥈", "🥉"]
-    out = f"{header('🏆', 'Top of the week')}\n<i>{label}</i>\n\n"
+    out = f"{header('📋', 'Отчёт за неделю')}\n<i>{label}</i>\n\n"
     for idx, (uid, user) in enumerate(ranked, start=1):
         marker = medals[idx - 1] if idx <= 3 else f"{idx}."
-        out += f"{marker} {escape_html(display_name(user['un'], user['fn']))} — <b>{user['total']}</b>\n"
+        out += f"{marker} {escape_html(short(display_name(user['un'], user['fn']), 55))} — <b>{user['total']}</b>\n"
 
     extras = []
     if loop_leader[1]["loops"]:
         extras.append(
-            f"🎧 Loops: <b>{escape_html(display_name(loop_leader[1]['un'], loop_leader[1]['fn']))}</b> — {loop_leader[1]['loops']}"
+            f"Лупы: <b>{escape_html(short(display_name(loop_leader[1]['un'], loop_leader[1]['fn']), 55))}</b> — {loop_leader[1]['loops']}"
         )
     if zip_leader[1]["zips"]:
         extras.append(
-            f"🗂 Zips: <b>{escape_html(display_name(zip_leader[1]['un'], zip_leader[1]['fn']))}</b> — {zip_leader[1]['zips']}"
+            f"Архивы: <b>{escape_html(short(display_name(zip_leader[1]['un'], zip_leader[1]['fn']), 55))}</b> — {zip_leader[1]['zips']}"
         )
     if files_leader[1]["files"]:
         extras.append(
-            f"📎 Files: <b>{escape_html(display_name(files_leader[1]['un'], files_leader[1]['fn']))}</b> — {files_leader[1]['files']}"
+            f"Файлы: <b>{escape_html(short(display_name(files_leader[1]['un'], files_leader[1]['fn']), 55))}</b> — {files_leader[1]['files']}"
         )
     if media_leader[1]["media"]:
         extras.append(
-            f"🖼 Media: <b>{escape_html(display_name(media_leader[1]['un'], media_leader[1]['fn']))}</b> — {media_leader[1]['media']}"
+            f"Медиа: <b>{escape_html(short(display_name(media_leader[1]['un'], media_leader[1]['fn']), 55))}</b> — {media_leader[1]['media']}"
         )
     if days.get(day_leader[0], 0):
         extras.append(
-            f"📅 Days: <b>{escape_html(display_name(day_leader[1]['un'], day_leader[1]['fn']))}</b> — {days[day_leader[0]]}"
+            f"Активные дни: <b>{escape_html(short(display_name(day_leader[1]['un'], day_leader[1]['fn']), 55))}</b> — {days[day_leader[0]]}"
         )
     if opp_leader[1]["opportunities"]:
         extras.append(
-            f"🎯 Opportunities: <b>{escape_html(display_name(opp_leader[1]['un'], opp_leader[1]['fn']))}</b> — {opp_leader[1]['opportunities']}"
+            f"Возможности: <b>{escape_html(short(display_name(opp_leader[1]['un'], opp_leader[1]['fn']), 55))}</b> — {opp_leader[1]['opportunities']}"
         )
     if extras:
         out += "\n\n" + "\n".join(extras)
@@ -1722,85 +1815,56 @@ async def send_document_private_or_ack(
 # ============================================================
 # COMMANDS
 # ============================================================
-HELP_TEXT = (
-    "❓ <b>301secrets Tracker</b>\n"
-    "\n"
-    "👤 <b>Для всех</b>\n"
-    "/my [7d|30d|month|all] — моя статистика\n"
-    "/help — помощь\n\n"
-    "📊 <b>Статистика</b>\n"
-    "/stats @user [период] — статистика участника\n"
-    "/top [период] [сортировка] — топ по активности\n"
-    "/candidates — кандидаты по активности за 30 дней\n"
-    "/profile @user — краткий профиль (в ЛС)\n"
-    "/last @user — последние сообщения\n\n"
-    "🎯 <b>Placements</b>\n"
-    "/place @user small/big [Артист | Трек | текст] — записать\n"
-    "/places @user — история placements участника\n"
-    "/roles [@user] — прогресс к роли (все / один)\n"
-    "/role @user small|big — сбросить шкалу после ручной выдачи\n\n"
-    "📝 <b>Заметки и архив</b>\n"
-    "/note @user текст — добавить заметку\n"
-    "/notes @user — заметки участника\n"
-    "/history @user — месячные архивы участника\n"
-    "/undo — отменить свою последнюю запись\n\n"
-    "⚙️ <b>Сервис</b>\n"
-    "/export — CSV в ЛС\n"
-    "/report — отчёт за прошлую неделю\n"
-    "/setreport — настроить авто-отчёт (ответом на сообщение)\n"
-    "/snapshot — архив прошлого месяца\n"
-    "/health — диагностика (в ЛС)\n"
-    "/backup — создать backup базы\n\n"
-    f"<i>Правило роли: {SMALL_THRESHOLD} Small или {LARGE_THRESHOLD} Big.\n"
-    "Бот только ведёт статистику; роль выдаётся вручную.\n"
-    "Категории: Messages / Loops / Zips / Files / Media.</i>"
-)
-
-
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    if is_admin(message):
-        await message.answer("👋 <b>301 Tracker работает.</b>\n\n/help")
-    else:
-        await message.answer("👋 Я отслеживаю активность в приватке.\n/my — твоя статистика.")
+@router.message(Command("menu"))
+async def cmd_start(message: Message, session: AsyncSession, state: FSMContext, bot: Bot):
+    await state.clear()
+    await upsert_user(session, message.from_user.id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    await session.commit()
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id), bot)
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(HELP_TEXT)
+async def cmd_help(message: Message, session: AsyncSession, state: FSMContext, bot: Bot):
+    await state.clear()
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "help"), bot)
 
 
 @router.message(Command("my"))
-async def cmd_my(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_my(message: Message, session: AsyncSession, command: CommandObject, state: FSMContext, bot: Bot):
+    await state.clear()
     period = command.args.split()[-1].lower() if command.args else "month"
     if period not in PERIOD_KEYS:
         period = "month"
-    await message.answer(
-        await build_stats_text(
-            session, message.from_user.id, message.from_user.full_name, period, False
-        )
-    )
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "stats", message.from_user.id, period), bot)
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, session: AsyncSession, command: CommandObject):
-    if not is_admin(message):
-        return
+async def cmd_stats(message: Message, session: AsyncSession, command: CommandObject, state: FSMContext, bot: Bot):
+    await state.clear()
     tokens = command.args.split() if command.args else []
     period = "month"
     if tokens and tokens[-1].lower() in PERIOD_KEYS:
         period = tokens.pop().lower()
-    uid, name, error = await find_user(session, message, " ".join(tokens))
+    if not is_admin(message) and (tokens or message.reply_to_message):
+        await message.answer("Для чужой статистики нужны права администратора. Твоя статистика — /my.")
+        return
+    if not tokens and not message.reply_to_message:
+        uid, name, error = message.from_user.id, message.from_user.full_name, None
+    else:
+        uid, name, error = await find_user(session, message, " ".join(tokens))
     if error:
         await message.answer(error)
         return
-    await message.answer(await build_stats_text(session, uid, name, period, True))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "stats", uid, period), bot)
 
 
 @router.message(Command("top"))
-async def cmd_top(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_top(message: Message, session: AsyncSession, command: CommandObject, state: FSMContext, bot: Bot):
     if not is_admin(message):
+        await message.answer("Рейтинг доступен администратору. Твоя статистика — /my.")
         return
+    await state.clear()
     period = "month"
     sort = "total"
     for token in command.args.split() if command.args else []:
@@ -1809,62 +1873,71 @@ async def cmd_top(message: Message, session: AsyncSession, command: CommandObjec
             period = t
         elif t in SORT_KEYS:
             sort = t
-    await message.answer(await build_top(session, sort, period))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "top", period=period, extra=sort), bot)
+
+
+@router.message(Command("members"))
+async def cmd_members(message: Message, session: AsyncSession, state: FSMContext, bot: Bot):
+    if not is_admin(message):
+        await message.answer("Участники доступны администратору. Твой профиль — /profile.")
+        return
+    await state.clear()
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "members"), bot)
 
 
 @router.message(Command("candidates"))
-async def cmd_candidates(message: Message, session: AsyncSession):
+async def cmd_candidates(message: Message, session: AsyncSession, bot: Bot):
     if not is_admin(message):
         return
-    await message.answer(await build_activity_candidates(session))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "candidates"), bot)
 
 
 @router.message(Command("places"))
-async def cmd_places(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_places(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
     if not is_admin(message):
         return
     uid, name, error = await resolve_command_user(message, session, command)
     if error:
         await message.answer(error)
         return
-    await message.answer(await build_places_text(session, uid, name))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "places", uid), bot)
 
 
 @router.message(Command("last"))
-async def cmd_last(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_last(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
     if not is_admin(message):
         return
     uid, name, error = await resolve_command_user(message, session, command)
     if error:
         await message.answer(error)
         return
-    await message.answer(await build_last_text(session, uid, name))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "last", uid), bot)
 
 
 @router.message(Command("notes"))
-async def cmd_notes(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_notes(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
     if not is_admin(message):
         return
     uid, name, error = await resolve_command_user(message, session, command)
     if error:
         await message.answer(error)
         return
-    await message.answer(await build_notes_text(session, uid, name))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "notes", uid), bot)
 
 
 @router.message(Command("history"))
-async def cmd_history(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_history(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
     if not is_admin(message):
         return
     uid, name, error = await resolve_command_user(message, session, command)
     if error:
         await message.answer(error)
         return
-    await message.answer(await build_history_text(session, uid, name))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "history", uid), bot)
 
 
 @router.message(Command("roles"))
-async def cmd_roles(message: Message, session: AsyncSession, command: CommandObject):
+async def cmd_roles(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
     if not is_admin(message):
         return
     tokens = command.args.split() if command.args else []
@@ -1873,9 +1946,9 @@ async def cmd_roles(message: Message, session: AsyncSession, command: CommandObj
         if error:
             await message.answer(error)
             return
-        await message.answer(await build_roles_text(session, uid, name))
+        await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "roles", uid), bot)
         return
-    await message.answer(await build_role_dashboard(session))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "board"), bot)
 
 
 @router.message(Command("role"))
@@ -1905,29 +1978,38 @@ async def cmd_role(message: Message, session: AsyncSession, command: CommandObje
         await message.answer("Укажи small или big.")
         return
 
-    p = await reset_placement_progress(session, uid, kind, message.from_user.id, name)
+    try:
+        p = await reset_placement_progress(session, uid, kind, message.from_user.id, name)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
     await message.answer(
-        f"✅ <b>Progress reset</b>\n\n"
+        f"✅ <b>Выдача роли подтверждена</b>\n\n"
         f"{escape_html(name)}\n"
-        f"Placement Role: <b>{kind.upper()}</b>\n\n"
-        f"<b>ALL TIME</b> unchanged\n"
+        f"Роль: <b>{kind.title()}</b>\n\n"
+        f"<b>За всё время</b>\n"
         f"Small · <b>{p['small']}</b> · Big · <b>{p['large']}</b>\n\n"
-        f"<b>CURRENT CYCLE</b> (after reset)\n"
+        f"<b>Новый цикл</b>\n"
         f"Small · <b>{p['small_since']}/{p['small_target']}</b>\n"
         f"Big · <b>{p['large_since']}/{p['large_target']}</b>\n\n"
-        f"<i>Telegram role is manual.</i>"
+        f"<i>Роль в Telegram выдаётся вручную.</i>"
     )
 
 
 @router.message(Command("profile"))
-async def cmd_profile(message: Message, session: AsyncSession, command: CommandObject, bot: Bot):
-    if not is_admin(message):
+async def cmd_profile(message: Message, session: AsyncSession, command: CommandObject, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message) and (command.args or message.reply_to_message):
+        await message.answer("Чужой профиль доступен администратору. Твой профиль — /profile без аргументов.")
         return
-    uid, name, error = await resolve_command_user(message, session, command)
+    if not command.args and not message.reply_to_message:
+        uid, name, error = message.from_user.id, message.from_user.full_name, None
+    else:
+        uid, name, error = await resolve_command_user(message, session, command)
     if error:
         await message.answer(error)
         return
-    await send_private_or_ack(message, bot, await build_profile_text(session, uid, name))
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "profile", uid), bot)
 
 
 @router.message(Command("place"))
@@ -1987,6 +2069,11 @@ async def cmd_place(message: Message, session: AsyncSession, command: CommandObj
     if not artist and not track and not comment:
         comment = "placement"
 
+    # Render the same bounded values that are persisted in the database.
+    artist = artist[:200] if artist else None
+    track = track[:200] if track else None
+    comment = comment[:NOTE_MAX_LEN] if comment else None
+
     # light de-dupe: same user + same tier + same body within 2 minutes
     recent_cut = utc_now() - timedelta(minutes=2)
     body_check = (artist or "") + "|" + (track or "") + "|" + (comment or "")
@@ -2031,10 +2118,10 @@ async def cmd_place(message: Message, session: AsyncSession, command: CommandObj
         f"{header('✅', 'Placement добавлен')}\n\n"
         f"👤 {escape_html(name)}　{'🟣 BIG' if tier == 'large' else '⚪️ small'}\n"
         f"{details_line}\n\n"
-        f"<b>ALL TIME</b>: Small {p['small']} · Big {p['large']} · Total {p['total']}\n"
-        f"<b>CYCLE</b>: Small {p['small_since']}/{p['small_target']} · "
+        f"<b>За всё время</b>: Small {p['small']} · Big {p['large']} · Всего {p['total']}\n"
+        f"<b>Текущий цикл</b>: Small {p['small_since']}/{p['small_target']} · "
         f"Big {p['large_since']}/{p['large_target']}"
-        + ("\n✅ Role threshold reached" if p["ready"] else "")
+        + ("\n✅ Порог роли достигнут" if p["ready"] else "")
     )
 
 
@@ -2101,6 +2188,9 @@ async def cmd_undo(message: Message, session: AsyncSession):
         await message.answer(f"Нечего отменять за последние {UNDO_WINDOW_MINUTES} минут.")
         return
     target = max(candidates, key=lambda x: (x.created_at, x.id))
+    if isinstance(target, Placement) and not await placement_can_be_undone(session, target):
+        await message.answer("По этому плейсменту уже подтверждена роль. Отмена недоступна.")
+        return
 
     if isinstance(target, Note):
         preview = f"NOTE · {target.username or target.user_id} · {target.text or '—'}"
@@ -2113,6 +2203,14 @@ async def cmd_undo(message: Message, session: AsyncSession):
     await message.answer(f"↩️ Отменено:\n<code>{escape_html(preview[:200])}</code>")
 
 
+async def placement_can_be_undone(session: AsyncSession, placement: Placement) -> bool:
+    state = await session.get(PlacementProgress, placement.user_id)
+    if state is not None:
+        await session.refresh(state)
+    reset_at = (state.big_reset_at if placement.tier == "large" else state.small_reset_at) if state else None
+    return not placement.used_by_award_id and (not reset_at or placement.created_at > reset_at)
+
+
 @router.message(Command("export"))
 async def cmd_export(message: Message, session: AsyncSession, bot: Bot):
     if not is_admin(message):
@@ -2123,15 +2221,18 @@ async def cmd_export(message: Message, session: AsyncSession, bot: Bot):
 
 
 @router.message(Command("report"))
-async def cmd_report(message: Message, session: AsyncSession):
+async def cmd_report(message: Message, session: AsyncSession, bot: Bot):
     if not is_admin(message):
         return
-    await message.answer(await build_weekly_report(session) or "No data")
+    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "report"), bot)
 
 
 @router.message(Command("setreport"))
 async def cmd_setreport(message: Message, session: AsyncSession):
     if not is_admin(message):
+        return
+    if message.chat.type not in {"group", "supergroup"} or (TRACK_CHAT_ID is not None and message.chat.id != TRACK_CHAT_ID):
+        await message.answer("Настрой отчёт в подключённой группе, ответив /setreport на сообщение в нужном топике.")
         return
     if not message.reply_to_message:
         await message.answer(
@@ -2143,7 +2244,7 @@ async def cmd_setreport(message: Message, session: AsyncSession):
         Setting(key="report_thread", value=str(message.reply_to_message.message_thread_id or 0))
     )
     await session.commit()
-    await message.answer(f"✅ Weekly report: каждый понедельник в 12:00 по {BOT_TIMEZONE}.")
+    await message.answer(f"✅ Отчёт настроен: каждый понедельник в 12:00 по {BOT_TIMEZONE}.")
 
 
 @router.message(Command("snapshot"))
@@ -2158,6 +2259,10 @@ async def cmd_snapshot(message: Message, session: AsyncSession):
 async def cmd_health(message: Message, session: AsyncSession, bot: Bot):
     if not is_admin(message):
         return
+    await send_private_or_ack(message, bot, await build_health_text(session))
+
+
+async def build_health_text(session: AsyncSession) -> str:
     counts = {
         "messages": await session.scalar(select(func.count(MsgLog.id))) or 0,
         "users": await session.scalar(select(func.count(User.user_id))) or 0,
@@ -2172,31 +2277,27 @@ async def cmd_health(message: Message, session: AsyncSession, bot: Bot):
     last_backup = await session.scalar(select(Setting).where(Setting.key == "backup_last"))
 
     db_size = "—"
-    if DB_URL.startswith("sqlite") and not DB_URL.startswith("sqlite:///:memory:"):
-        path = Path(DB_URL.split("///", 1)[-1])
+    if DB_URL.startswith("sqlite") and make_url(DB_URL).database not in {None, ":memory:"}:
+        path = Path(make_url(DB_URL).database)
         if path.exists():
             db_size = f"{path.stat().st_size / 1024 / 1024:.2f} MB"
 
-    me = await bot.get_me()
-    privacy_ok = me.can_read_all_group_messages
     text_value = (
-        f"{header('🩺', 'Health')}\n\n"
-        f"🤖 Bot: @{escape_html(me.username)}\n"
-        f"💾 DB: ✅ OK · {escape_html(db_size)}\n\n"
-        f"✏️ Messages: {counts['messages']}　👥 Users: {counts['users']}\n"
-        f"🎯 Placements: {counts['placements']}　📝 Notes: {counts['notes']}\n"
-        f"🗂 Snapshots: {counts['snapshots']}　🏅 Awards: {counts['awards']}\n\n"
-        f"🕒 TZ: <code>{escape_html(BOT_TIMEZONE)}</code>\n"
-        f"📍 Track chat: <code>{TRACK_CHAT_ID if TRACK_CHAT_ID is not None else 'ANY GROUP'}</code>\n"
-        f"👮 Admins: {len(ADMIN_IDS)}\n"
-        f"🔒 Privacy read: {'✅ OK' if privacy_ok else '⚠️ CHECK BOTFATHER / ADMIN RIGHTS'}\n"
-        f"🎖 Rule: <code>{SMALL_THRESHOLD} small OR {LARGE_THRESHOLD} large</code>\n\n"
-        f"Last message: <code>{format_local(last_msg) if last_msg else '—'}</code>\n"
-        f"Last snapshot: <code>{escape_html(last_snap.value if last_snap else '—')}</code>\n"
-        f"Last report: <code>{escape_html(last_report.value if last_report else '—')}</code>\n"
-        f"Last backup: <code>{escape_html(last_backup.value if last_backup else '—')}</code>"
+        f"{header('🩺', 'Состояние трекера')}\n\n"
+        f"База данных: доступна · {escape_html(db_size)}\n\n"
+        f"Сообщения: <b>{counts['messages']}</b> · Участники: <b>{counts['users']}</b>\n"
+        f"Плейсменты: {counts['placements']} · Заметки: {counts['notes']}\n"
+        f"Месячные записи: {counts['snapshots']} · Выданные роли: {counts['awards']}\n\n"
+        f"Часовой пояс: <code>{escape_html(BOT_TIMEZONE)}</code>\n"
+        f"Отслеживаемый чат: <code>{TRACK_CHAT_ID if TRACK_CHAT_ID is not None else 'любая группа'}</code>\n"
+        f"Администраторы: {len(ADMIN_IDS)}\n"
+        f"Порог роли: {SMALL_THRESHOLD} Small или {LARGE_THRESHOLD} Big\n\n"
+        f"Последняя активность: {format_local(last_msg) if last_msg else 'пока нет'}\n"
+        f"Последний архив: {escape_html(last_snap.value if last_snap else 'пока нет')}\n"
+        f"Последний отчёт: {escape_html(last_report.value if last_report else 'пока нет')}\n"
+        f"Последняя копия: {escape_html(last_backup.value if last_backup else 'пока нет')}"
     )
-    await send_private_or_ack(message, bot, text_value)
+    return text_value
 
 
 @router.message(Command("backup"))
@@ -2219,21 +2320,26 @@ async def cmd_backup(message: Message, session: AsyncSession):
 # BACKUP / CATCH-UP / RETENTION  (items 5, 24, 25, 26)
 # ============================================================
 async def backup_database(session: AsyncSession | None = None) -> Path | None:
-    if not DB_URL.startswith("sqlite") or DB_URL.startswith("sqlite:///:memory:"):
+    if not DB_URL.startswith("sqlite") or make_url(DB_URL).database in {None, ":memory:"}:
         return None
-    db_path = DB_URL.split("///", 1)[-1]
+    db_path = make_url(DB_URL).database
     source = Path(db_path)
     if not source.exists():
         return None
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    target = BACKUP_DIR / f"tracker_{local_now():%Y-%m-%d_%H-%M-%S}.db"
-    safe_target = str(target).replace("'", "''")
+    target = BACKUP_DIR / f"tracker_{local_now():%Y-%m-%d_%H-%M-%S_%f}.db"
 
-    connection = sqlite3.connect(str(source), timeout=30)
-    try:
-        connection.execute(f"VACUUM INTO '{safe_target}'")
-    finally:
-        connection.close()
+    def copy_database():
+        connection = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        destination = sqlite3.connect(str(target), timeout=30)
+        try:
+            connection.backup(destination)
+        finally:
+            destination.close()
+            connection.close()
+
+    # SQLite backup can take seconds: keep tracking and button clicks responsive.
+    await asyncio.to_thread(copy_database)
 
     try:
         os.chmod(target, 0o600)
@@ -2428,41 +2534,24 @@ async def snapshot_loop() -> None:
 # ============================================================
 async def setup_commands(bot: Bot) -> None:
     public = [
+        BotCommand(command="menu", description="Открыть меню"),
         BotCommand(command="my", description="Моя статистика"),
+        BotCommand(command="profile", description="Мой профиль"),
         BotCommand(command="help", description="Помощь"),
     ]
     await bot.set_my_commands(public, scope=BotCommandScopeDefault())
     await bot.set_my_commands(public, scope=BotCommandScopeAllGroupChats())
 
-    admin = [
-        BotCommand(command="stats", description="Статистика участника"),
-        BotCommand(command="top", description="Топ по активности"),
-        BotCommand(command="candidates", description="Кандидаты по активности"),
-        BotCommand(command="places", description="История placements"),
-        BotCommand(command="notes", description="Заметки"),
-        BotCommand(command="history", description="История месяцев"),
-        BotCommand(command="roles", description="Прогресс плейсментов"),
-        BotCommand(command="profile", description="Профиль участника"),
-        BotCommand(command="last", description="Последние сообщения"),
-        BotCommand(command="place", description="Записать placement"),
-        BotCommand(command="role", description="Сбросить прогресс после роли"),
-        BotCommand(command="note", description="Добавить заметку"),
-        BotCommand(command="undo", description="Отменить запись"),
-        BotCommand(command="export", description="CSV экспорт"),
-        BotCommand(command="report", description="Недельный отчёт"),
-        BotCommand(command="setreport", description="Настроить отчёт"),
-        BotCommand(command="snapshot", description="Снапшот месяца"),
-        BotCommand(command="health", description="Диагностика"),
-        BotCommand(command="backup", description="Backup базы"),
-        BotCommand(command="my", description="Моя статистика"),
-        BotCommand(command="help", description="Помощь"),
-    ]
+    admin = public + [BotCommand(command="members", description="Участники и поиск"), BotCommand(command="top", description="Рейтинг группы")]
     for admin_id in ADMIN_IDS:
-        await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=admin_id))
+        try:
+            await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            log.warning("Could not set private command menu for an admin")
     if TRACK_CHAT_ID is not None:
         try:
             await bot.set_my_commands(
-                admin,
+                public,
                 scope=BotCommandScopeChatAdministrators(chat_id=TRACK_CHAT_ID),
             )
         except Exception:
@@ -2478,15 +2567,16 @@ async def setup_commands(bot: Bot) -> None:
 async def global_error_handler(event: ErrorEvent, bot: Bot):
     err = event.exception
     log.error("Unhandled error: %s\n%s", err, "".join(traceback.format_exception(type(err), err, err.__traceback__)))
-    text_msg = (
-        f"⚠️ <b>Bot error</b>\n\n"
-        f"<code>{escape_html(type(err).__name__)}: {escape_html(str(err)[:300])}</code>"
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text_msg)
-        except Exception:
-            pass
+    # Raw exceptions can contain token-bearing URLs; keep details in process logs.
+    message = event.update.message
+    query = event.update.callback_query
+    try:
+        if query:
+            await query.answer("Не получилось выполнить действие. Открой /menu и повтори.", show_alert=True)
+        elif message and (message.chat.type == "private" or is_command_message(message)):
+            await message.answer("Не получилось выполнить действие. Открой /menu и повтори.")
+    except Exception:
+        log.warning("Could not deliver error notice")
     return True
 
 
@@ -2528,7 +2618,7 @@ async def main() -> None:
 
         await setup_commands(bot)
         await startup_catchup(bot)
-        dp = Dispatcher()
+        dp = Dispatcher(events_isolation=SimpleEventIsolation())
         dp.include_router(router)
         dp.errors.register(global_error_handler)
 
@@ -2550,9 +2640,11 @@ async def main() -> None:
         await engine.dispose()
 
 
+register_ui(router, sys.modules[__name__])
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Bot stopped")
- 

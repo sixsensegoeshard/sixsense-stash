@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 *$py.class
@@ -13,6 +15,13 @@ data/*.sqlite
 *.sqlite
 *.db-shm
 *.db-wal
+*.sqlite-shm
+*.sqlite-wal
+backups/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .idea/
 .vscode/
 *.log
