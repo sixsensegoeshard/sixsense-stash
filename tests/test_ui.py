@@ -1,6 +1,8 @@
 """Integration tests: real aiogram dispatcher + memory DB + fake Telegram API."""
 
 import asyncio
+import csv
+import io
 import re
 import sqlite3
 import tempfile
@@ -21,6 +23,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from test_tracking import bot as app, message, NOW
 from tracker_ui import Screen, build_screen, button, edit_screen, keyboard, parse_payload, save_entry
+from tracker_records import record_version
 
 
 class FakeTelegram(BaseSession):
@@ -122,7 +125,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
     async def test_start_and_period_navigation_edit_one_message(self):
         home = await self.command("/start")
         self.assertIn("301 / TRACKER", home.text)
-        stats = await self.click(home, "Моя статистика")
+        stats = await self.click(home, "Моя активность")
         self.assertEqual(stats.message_id, home.message_id)
         changed = await self.click(stats, "7 дней")
         self.assertIn("последние 7 дней", changed.text)
@@ -241,15 +244,16 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         result = await self.command("/place @artist small " + "X" * 4070)
         self.assertLess(len(result.text), 4096)
         async with self.sessions() as session:
-            placement = await session.scalar(select(app.Placement))
-            self.assertEqual(len(placement.comment), 500)
+            self.assertEqual(await session.scalar(select(func.count(app.Placement.id))), 0)
+            self.assertIn("после подтверждения", result.text)
 
     async def test_search_text_in_private_chat_opens_profile(self):
         members = await self.click(await self.command("/start"), "Участники")
         await self.click(members, "Найти")
         result = await self.command("@artist")
-        self.assertIn("Карточка участника", result.text)
-        self.assertIn("@artist", result.text)
+        profile = await self.click(result, "@artist")
+        self.assertIn("Плейсменты и прогресс", profile.text)
+        self.assertIn("@artist", profile.text)
 
     async def test_empty_and_long_lists_are_bounded_and_paginated(self):
         async with self.sessions() as session:
@@ -319,12 +323,13 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await app.reset_placement_progress(session, 10, "small", 900, "artist")
             target = await session.scalar(select(app.Placement).order_by(app.Placement.id.desc()).limit(1))
             with self.assertRaises(ValueError):
-                await save_entry(app, session, 900, {"kind": "undo", "uid": 10, "target": f"place-{target.id}"})
+                await save_entry(app, session, 900, {"kind": "undo", "uid": 10, "target": f"place-{target.id}", "version": record_version(target)})
             self.assertEqual(await session.scalar(select(func.count(app.Placement.id))), app.SMALL_THRESHOLD)
 
     async def test_cancelled_service_confirmation_does_not_mutate(self):
         admin = await self.click(await self.command("/start"), "Управление")
-        preview = await self.click(admin, "Архив месяца")
+        service = await self.click(admin, "Сервис")
+        preview = await self.click(service, "Пересчитать")
         await self.command("/menu")
         with patch.object(app, "make_snapshot", new_callable=AsyncMock) as snapshot:
             await self.click(preview, "Подтвердить")
@@ -369,6 +374,249 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         home = await self.command("/start")
         await self.click(home, "", raw="ui:broken")
         self.assertTrue(self.api.calls[-1].show_alert)
+
+    async def test_edit_delete_restore_round_trip_requires_confirmations(self):
+        async with self.sessions() as session:
+            original_date = app.utc_now() - timedelta(days=1)
+            session.add(app.Note(user_id=10, actor_id=900, text="original", created_at=original_date))
+            await session.commit()
+        notes = await self.command("/notes @artist")
+        detail = await self.click(notes, "Открыть")
+        await self.click(detail, "Исправить текст")
+        preview = await self.command("corrected <text>")
+        async with self.sessions() as session:
+            self.assertEqual((await session.scalar(select(app.Note))).text, "original")
+        saved = await self.click(preview, "Сохранить")
+        self.assertIn("Заметка исправлена", saved.text)
+        detail = await self.click(saved, "Открыть")
+        deletion = await self.click(detail, "Удалить")
+        async with self.sessions() as session:
+            self.assertEqual(await session.scalar(select(func.count(app.Note.id))), 1)
+        await self.click(deletion, "Подтвердить")
+        await self.click(deletion, "Подтвердить")
+        async with self.sessions() as session:
+            self.assertEqual(await session.scalar(select(func.count(app.Note.id))), 0)
+            change = await session.scalar(select(app.RecordChange).where(app.RecordChange.action == "delete"))
+            change_id = change.id
+        profile = await self.command("/profile @artist")
+        changes = await self.click(profile, "История изменений")
+        change = await self.click(changes, f"Изменение #{change_id}")
+        restoring = await self.click(change, "Восстановить")
+        await self.click(restoring, "Подтвердить")
+        await self.click(restoring, "Подтвердить")
+        async with self.sessions() as session:
+            records = (await session.scalars(select(app.Note))).all()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].text, "corrected <text>")
+            self.assertEqual(records[0].created_at, original_date)
+            self.assertEqual(await session.scalar(select(func.count(app.RecordChange.id))), 3)
+
+    async def test_revise_draft_keeps_participant_and_placement_type(self):
+        profile = await self.command("/profile @artist")
+        choice = await self.click(profile, "＋ Плейсмент")
+        await self.click(choice, "Big")
+        draft = await self.command("Artist | Wrong")
+        await self.click(draft, "Изменить текст")
+        corrected = await self.command("Artist | Correct")
+        await self.click(corrected, "Сохранить")
+        async with self.sessions() as session:
+            placement = await session.scalar(select(app.Placement))
+            self.assertEqual((placement.user_id, placement.tier, placement.track), (10, "large", "Correct"))
+
+    async def test_stale_edit_preview_cannot_overwrite_new_content(self):
+        async with self.sessions() as session:
+            session.add(app.Note(user_id=10, actor_id=900, text="original", created_at=app.utc_now()))
+            await session.commit()
+        detail = await self.click(await self.command("/notes @artist"), "Открыть")
+        await self.click(detail, "Исправить текст")
+        preview = await self.command("stale correction")
+        async with self.sessions() as session:
+            note = await session.scalar(select(app.Note))
+            note.text = "another admin's correction"
+            await session.commit()
+        result = await self.click(preview, "Сохранить")
+        self.assertIn("уже изменена", result.text)
+        async with self.sessions() as session:
+            self.assertEqual((await session.scalar(select(app.Note))).text, "another admin's correction")
+            self.assertEqual(await session.scalar(select(func.count(app.RecordChange.id))), 0)
+
+    async def test_change_placement_type_updates_progress_after_confirmation(self):
+        async with self.sessions() as session:
+            session.add(app.Placement(user_id=10, actor_id=900, tier="small", comment="release", created_at=app.utc_now()))
+            await session.commit()
+        detail = await self.click(await self.command("/places @artist"), "Открыть")
+        choose = await self.click(detail, "Изменить Small")
+        preview = await self.click(choose, "Big")
+        async with self.sessions() as session:
+            self.assertEqual((await session.scalar(select(app.Placement))).tier, "small")
+        await self.click(preview, "Сохранить")
+        async with self.sessions() as session:
+            progress = await app.placement_progress(session, 10)
+            self.assertEqual((progress["small"], progress["large"]), (0, 1))
+
+    async def test_roles_show_only_eligible_confirmation_and_protect_consumed_records(self):
+        async with self.sessions() as session:
+            empty = await build_screen(app, session, 900, "roles", 10)
+            self.assertFalse(any("Подтвердить" in b.text for row in empty.markup.inline_keyboard for b in row))
+            for _ in range(app.SMALL_THRESHOLD):
+                session.add(app.Placement(user_id=10, tier="small", comment="release", created_at=app.utc_now() - timedelta(minutes=1)))
+            await session.commit()
+            ready = await build_screen(app, session, 900, "roles", 10)
+            buttons = [b.text for row in ready.markup.inline_keyboard for b in row]
+            self.assertIn("Подтвердить Small", buttons)
+            self.assertNotIn("Подтвердить Big", buttons)
+            await app.reset_placement_progress(session, 10, "small", 900, "artist")
+        detail = await self.click(await self.command("/places @artist"), "1.")
+        self.assertIn("🔒", detail.text)
+        self.assertFalse(any("Удалить" in b.text for row in detail.reply_markup.inline_keyboard for b in row))
+
+    async def test_unknown_command_does_not_erase_pending_draft(self):
+        await self.click(await self.command("/profile @artist"), "＋ Заметка")
+        await self.command("/unknown_command")
+        draft = await self.command("still the same note")
+        await self.click(draft, "Сохранить")
+        async with self.sessions() as session:
+            self.assertEqual((await session.scalar(select(app.Note))).text, "still the same note")
+
+    async def test_search_pagination_retains_ambiguous_name_filter(self):
+        async with self.sessions() as session:
+            for index in range(12):
+                await app.upsert_user(session, 1000 + index, f"match{index}", "Same")
+            await session.commit()
+        await self.click(await self.command("/members"), "Найти")
+        first = await self.command("match")
+        self.assertIn("12 в базе", first.text)
+        second = await self.click(first, "Далее")
+        self.assertIn("страница 2/2", second.text)
+        self.assertIn("Поиск: <b>match</b>", second.text)
+        self.assertFalse(any("@admin" in b.text for row in second.reply_markup.inline_keyboard for b in row))
+
+    async def test_report_switch_requires_confirmation_and_handles_cancellation(self):
+        async with self.sessions() as session:
+            session.add(app.Setting(key="report_chat", value=str(app.TRACK_CHAT_ID)))
+            await session.commit()
+        reports = await self.click(await self.click(await self.command("/menu"), "Управление"), "Отчёты")
+        prompt = await self.click(reports, "Выключить")
+        await self.click(prompt, "Отмена")
+        async with self.sessions() as session:
+            self.assertIsNotNone(await session.get(app.Setting, "report_chat"))
+        prompt = await self.click(await self.last_reports(), "Выключить")
+        result = await self.click(prompt, "Подтвердить")
+        self.assertIn("Автоотчёт выключен", result.text)
+        async with self.sessions() as session:
+            self.assertIsNone(await session.get(app.Setting, "report_chat"))
+
+    async def last_reports(self):
+        return await self.click(await self.click(await self.command("/menu"), "Управление"), "Отчёты")
+
+    async def test_legacy_write_shortcuts_do_not_mutate_database(self):
+        async with self.sessions() as session:
+            session.add(app.Note(user_id=10, actor_id=900, text="keep", created_at=app.utc_now()))
+            await session.commit()
+        for command in ("/place @artist big Release", "/note @artist new", "/role @artist small", "/undo", "/snapshot"):
+            await self.command(command)
+        async with self.sessions() as session:
+            self.assertEqual(await session.scalar(select(func.count(app.Note.id))), 1)
+            self.assertEqual(await session.scalar(select(func.count(app.Placement.id))), 0)
+            self.assertEqual(await session.scalar(select(func.count(app.MonthlySnapshot.id))), 0)
+            self.assertEqual(await session.scalar(select(func.count(app.RoleAward.id))), 0)
+
+    async def test_csv_includes_note_only_members_and_escapes_names_as_data(self):
+        async with self.sessions() as session:
+            await app.upsert_user(session, 10, "artist", "=formula")
+            session.add(app.Note(user_id=777, username="@note_only", text="note", actor_id=900, created_at=app.utc_now()))
+            await session.commit()
+            exported = await app.build_export(session)
+        rows = list(csv.DictReader(io.StringIO(exported.data.decode("utf-8-sig"))))
+        self.assertIn("777", {row["user_id"] for row in rows})
+        self.assertEqual(next(row for row in rows if row["user_id"] == "10")["first_name"], "'=formula")
+
+    def test_record_callback_lengths_for_large_ids(self):
+        from tracker_ui import record_key
+        for action in ("rec", "edt", "del", "tier"):
+            data = button(99999999999, "test", action, 99999999999,
+                          extra=record_key("place", 2147483647, "a" * 12)).callback_data
+            self.assertLessEqual(len(data.encode()), 64)
+
+    async def test_regular_user_cannot_read_private_notes_through_record_callback(self):
+        async with self.sessions() as session:
+            note = app.Note(user_id=10, actor_id=900, text="PRIVATE ADMIN CONTENT", created_at=app.utc_now())
+            session.add(note)
+            await session.commit()
+            note_id = note.id
+            with self.assertRaises(PermissionError):
+                await build_screen(app, session, 10, "rec", 10, extra=f"n.{note_id}")
+        home = await self.command("/menu", actor=10)
+        result = await self.click(home, "", actor=10,
+            raw=button(10, "", "rec", 10, extra=f"n.{note_id}").callback_data)
+        self.assertNotIn("PRIVATE ADMIN CONTENT", result.text)
+
+    async def test_tier_only_change_preserves_partial_legacy_content(self):
+        async with self.sessions() as session:
+            session.add(app.Placement(user_id=10, tier="small", artist="Artist", track=None,
+                                      comment="Original comment", proof="https://example.test/proof",
+                                      actor_id=900, created_at=app.utc_now()))
+            await session.commit()
+        detail = await self.click(await self.command("/places @artist"), "Открыть")
+        chooser = await self.click(detail, "Изменить Small")
+        preview = await self.click(chooser, "Big")
+        await self.click(preview, "Сохранить")
+        async with self.sessions() as session:
+            record = await session.scalar(select(app.Placement))
+            self.assertEqual((record.tier, record.artist, record.track, record.comment, record.proof),
+                             ("large", "Artist", None, "Original comment", "https://example.test/proof"))
+
+    async def test_old_filtered_page_cannot_use_a_new_search_context(self):
+        async with self.sessions() as session:
+            for prefix in ("alpha", "beta"):
+                for index in range(10):
+                    await app.upsert_user(session, (1000 if prefix == "alpha" else 2000) + index,
+                                          f"{prefix}{index}", prefix)
+            await session.commit()
+        await self.click(await self.command("/members"), "Найти")
+        alpha = await self.command("alpha")
+        await self.click(await self.command("/members"), "Найти")
+        beta = await self.command("beta")
+        await self.click(alpha, "Далее")
+        self.assertIsInstance(self.api.calls[-1], AnswerCallbackQuery)
+        self.assertTrue(self.api.calls[-1].show_alert)
+        second = await self.click(beta, "Далее")
+        self.assertIn("Поиск: <b>beta</b>", second.text)
+        self.assertIn("страница 2/2", second.text)
+
+    async def test_expired_current_confirmation_clears_form_without_writes(self):
+        await self.click(await self.command("/profile @artist"), "＋ Заметка")
+        draft = await self.command("expired")
+        with patch.object(app, "utc_now", return_value=app.utc_now() + timedelta(minutes=16)):
+            await self.click(draft, "Сохранить")
+        result = await self.command("ordinary message after expiry")
+        self.assertIn("301 / TRACKER", result.text)
+        async with self.sessions() as session:
+            self.assertEqual(await session.scalar(select(func.count(app.Note.id))), 0)
+
+    async def test_expired_tier_selection_clears_current_form(self):
+        chooser = await self.click(await self.command("/profile @artist"), "＋ Плейсмент")
+        with patch.object(app, "utc_now", return_value=app.utc_now() + timedelta(minutes=16)):
+            await self.click(chooser, "Small")
+        result = await self.command("ordinary text")
+        self.assertIn("301 / TRACKER", result.text)
+
+    async def test_old_unfiltered_pager_does_not_adopt_an_active_search(self):
+        async with self.sessions() as session:
+            for prefix, offset in (("alpha", 1000), ("beta", 2000)):
+                for index in range(10):
+                    await app.upsert_user(session, offset + index, f"{prefix}{index}", prefix)
+            await session.commit()
+        unfiltered = await self.command("/members")
+        await self.click(unfiltered, "Найти")
+        await self.command("alpha")
+        old_page = await self.click(unfiltered, "Далее")
+        self.assertNotIn("Поиск:", old_page.text)
+        await self.click(await self.command("/members"), "Найти")
+        await self.command("beta")
+        result = await self.click(old_page, "‹ Назад")
+        self.assertNotIn("Поиск:", result.text)
+        self.assertIn("22 в базе", result.text)
 
     async def test_group_menu_goes_to_private_chat(self):
         result = await self.command("/menu", chat_id=app.TRACK_CHAT_ID)

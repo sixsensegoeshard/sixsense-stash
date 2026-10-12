@@ -14,7 +14,6 @@ Implements critical fixes + major feature upgrades:
 from __future__ import annotations
 
 import asyncio
-import calendar
 import csv
 import io
 import logging
@@ -22,7 +21,6 @@ import os
 import re
 import sqlite3
 import sys
-import time
 import traceback
 import weakref
 from collections import defaultdict
@@ -54,7 +52,7 @@ from aiogram.types import (
     Message,
     TelegramObject,
 )
-from tracker_ui import build_screen, deliver, register_ui, short, stats_card
+from tracker_ui import build_screen, deliver, register_ui, short
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -122,7 +120,6 @@ except ValueError as exc:
     raise RuntimeError(f"Placement thresholds must be integers: {exc}") from exc
 
 NOTE_MAX_LEN = 500
-THROTTLE_SECONDS = 1.5
 UNDO_WINDOW_MINUTES = 15
 OPPORTUNITY_TAGS = tuple(
     tag.strip().lower()
@@ -256,6 +253,22 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(String)
 
 
+class RecordChange(Base):
+    """Append-only audit trail for corrections to manual records."""
+
+    __tablename__ = "record_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    record_kind: Mapped[str] = mapped_column(String)
+    record_id: Mapped[int] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String)
+    actor_id: Mapped[int] = mapped_column(BigInteger)
+    before_json: Mapped[str] = mapped_column(String)
+    after_json: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
 engine_kwargs: dict = {"echo": False}
 if DB_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"timeout": 30}
@@ -267,7 +280,6 @@ Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 # APP CONSTANTS
 # ============================================================
 router = Router()
-WRITE_LAST: dict[int, float] = {}
 USER_WRITE_LOCKS: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
@@ -304,26 +316,10 @@ SORT_KEYS = {
     "media",
     "days",
     "opportunities",
+    "contribution",
 }
 PERIOD_KEYS = {"7d", "30d", "month", "all"}
 
-MONTHS_EN = {
-    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-}
-
-EMPTY_STATS = {
-    "un": None,
-    "fn": None,
-    "messages": 0,
-    "loops": 0,
-    "zips": 0,
-    "files": 0,
-    "media": 0,
-    "total": 0,
-    "opportunities": 0,
-}
 
 
 # ============================================================
@@ -371,33 +367,6 @@ def header(emoji: str, title: str) -> str:
     return f"{emoji} <b>{title}</b>"
 
 
-def metric_line(parts: list[tuple[str, int | float]], *, hide_zero: bool = True) -> str:
-    """Compact chips: 🎵 3 · 🖼 5 · 📅 2"""
-    chunks: list[str] = []
-    for label, value in parts:
-        if hide_zero and not value:
-            continue
-        if isinstance(value, float):
-            shown = f"{value:.1f}".rstrip("0").rstrip(".")
-        else:
-            shown = str(value)
-        chunks.append(f"{label} {shown}")
-    return " · ".join(chunks)
-
-
-def activity_bits(u: dict, day_count: int = 0, *, hide_zero: bool = True) -> str:
-    return metric_line(
-        [
-            ("🎵", u.get("loops", 0)),
-            ("🗂", u.get("zips", 0)),
-            ("📎", u.get("files", 0)),
-            ("🖼", u.get("media", 0)),
-            ("✏️", u.get("messages", 0)),
-            ("🎯", u.get("opportunities", 0)),
-            ("📅", day_count),
-        ],
-        hide_zero=hide_zero,
-    )
 
 
 def short_date(dt_value: datetime) -> str:
@@ -408,13 +377,6 @@ def format_local(dt_value: datetime) -> str:
     return local_from_utc_naive(dt_value).strftime("%d.%m.%Y %H:%M")
 
 
-def throttle(user_id: int) -> bool:
-    now = time.monotonic()
-    last = WRITE_LAST.get(user_id, 0.0)
-    if now - last < THROTTLE_SECONDS:
-        return True
-    WRITE_LAST[user_id] = now
-    return False
 
 
 def is_admin(message: Message) -> bool:
@@ -462,7 +424,9 @@ def current_month_range() -> tuple[datetime, datetime]:
 
 def current_month_label() -> str:
     now = local_now()
-    return f"{MONTHS_EN[now.month]} {now.year}"
+    months = ("", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+    return f"{months[now.month]} {now.year}"
 
 
 def period_bounds(period: str) -> tuple[datetime | None, datetime, str]:
@@ -823,8 +787,13 @@ class DatabaseMiddleware(BaseMiddleware):
             if isinstance(event, Message):
                 try:
                     if is_command_message(event) and event.from_user and not event.from_user.is_bot:
-                        if state := data.get("state"):
-                            await state.clear()
+                        command_name = event.text.split()[0].split("@", 1)[0][1:].lower()
+                        if command_name in {"start", "menu", "my", "stats", "profile", "help", "top",
+                                            "members", "candidates", "places", "last", "notes", "history",
+                                            "roles", "role", "place", "note", "undo", "export", "report",
+                                            "snapshot", "health", "backup", "cancel", "setreport"}:
+                            if state := data.get("state"):
+                                await state.clear()
                         await upsert_user(
                             session, event.from_user.id, event.from_user.username,
                             event.from_user.first_name, event.from_user.last_name,
@@ -1273,14 +1242,6 @@ async def get_user_stats(
     return base
 
 
-async def build_stats_text(
-    session: AsyncSession, uid: int, name: str | None, period: str, hints: bool
-) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    s = await get_user_stats(session, uid, period)
-
-    return stats_card(name, s)
 
 
 async def build_top(session: AsyncSession, sort: str, period: str) -> str:
@@ -1290,13 +1251,20 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     if not users:
         return f"Нет активности за {escape_html(label)}."
 
+    def metric(uid, user, active_days):
+        if sort == "days":
+            return active_days.get(uid, 0)
+        if sort == "contribution":
+            return activity_score(user, active_days.get(uid, 0))
+        return user.get(sort, 0)
+
     def sort_key(item):
         uid, user = item
-        primary = days.get(uid, 0) if sort == "days" else user.get(sort, 0)
+        primary = metric(uid, user, days)
         # stable tie-breakers
         return (primary, user.get("total", 0), user.get("loops", 0), uid)
 
-    users = {uid: user for uid, user in users.items() if (days.get(uid, 0) if sort == "days" else user.get(sort, 0)) > 0}
+    users = {uid: user for uid, user in users.items() if metric(uid, user, days) > 0}
     if not users:
         return f"🏆 <b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности в этой категории."
     current = sorted(users.items(), key=sort_key, reverse=True)[:10]
@@ -1310,10 +1278,10 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
 
         def prev_key(item):
             uid, user = item
-            primary = prev_days.get(uid, 0) if sort == "days" else user.get(sort, 0)
+            primary = metric(uid, user, prev_days)
             return (primary, user.get("total", 0), user.get("loops", 0), uid)
 
-        prev_users = {uid: user for uid, user in prev_users.items() if (prev_days.get(uid, 0) if sort == "days" else user.get(sort, 0)) > 0}
+        prev_users = {uid: user for uid, user in prev_users.items() if metric(uid, user, prev_days) > 0}
         prev_rank = {
             uid: idx
             for idx, (uid, _) in enumerate(
@@ -1327,321 +1295,28 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     labels = {
         "total": "Вся активность", "messages": "Сообщения",
         "loops": "Лупы", "zips": "Архивы", "files": "Файлы",
-        "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности",
+        "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности", "contribution": "По вкладу",
     }
     medals = ["🥇", "🥈", "🥉"]
     out = f"{header('🏆', f'Рейтинг · {labels.get(sort, sort)}')}\n<i>{escape_html(label)}</i>\n\n"
     for idx, (uid, user) in enumerate(current, start=1):
         marker = medals[idx - 1] if idx <= 3 else f"{idx}."
         name = escape_html(short(display_name(user["un"], user["fn"]), 55))
-        value = days.get(uid, 0) if sort == "days" else user.get(sort, 0)
-        out += f"{marker} {name} — <b>{value}</b> {arrows.get(uid, '')}\n"
+        value = metric(uid, user, days)
+        out += f"{marker} {name} — <b>{value:g}</b> {arrows.get(uid, '')}\n"
+    if sort == "contribution":
+        out += "\n<i>Баллы: луп 3 · архив 2 · файл 1,5 · возможность 2 · медиа 1 · сообщение 0,25 · активный день 1. "
+        out += "Это объём вклада, а не оценка качества музыки.</i>"
     return out
 
 
-async def build_activity_candidates(session: AsyncSession) -> str:
-    start, end, _ = period_bounds("30d")
-    users = await user_pivot(session, start, end)
-    days = await user_days(session, start, end)
-    if not users:
-        return (
-            "🌟 <b>Активные участники</b>\n"
-            "<i>Последние 30 дней</i>\n\n"
-            "Нет активности за последние 30 дней."
-        )
-
-    def score(uid: int, u: dict) -> tuple:
-        return (
-            u["loops"] * 3
-            + u["zips"] * 2
-            + u["files"] * 1.5
-            + u["opportunities"] * 2
-            + days.get(uid, 0)
-            + u["media"]
-            + u["messages"] * 0.25,
-            u["loops"],
-            u["zips"],
-            u["opportunities"],
-            days.get(uid, 0),
-            u["total"],
-        )
-
-    ranked = sorted(users.items(), key=lambda item: score(item[0], item[1]), reverse=True)[:3]
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for idx, (uid, u) in enumerate(ranked):
-        name = escape_html(short(display_name(u["un"], u["fn"]), 55))
-        points = score(uid, u)[0]
-        lines.append(f"{medals[idx]} <b>{name}</b> · {points:g} баллов\n{u['total']} действий · {days.get(uid, 0)} активных дней")
-    out = "🌟 <b>Активные участники</b>\n<i>Последние 30 дней</i>\n\n" + "\n\n".join(lines)
-    out += "\n\n<i>Баллы: луп 3 · архив 2 · файл 1,5 · возможность 2 · медиа 1 · сообщение 0,25 · активный день 1. Возможность — дополнительный признак сообщения.</i>"
-    return out
-
-async def build_last_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    rows = (
-        await session.execute(
-            select(MsgLog)
-            .where(MsgLog.user_id == uid)
-            .order_by(MsgLog.created_at.desc())
-            .limit(15)
-        )
-    ).scalars().all()
-    if not rows:
-        return f"🕐 <b>{escape_html(name)}</b>\n\nNo messages"
-    out = f"🕐 <b>Last messages: {escape_html(name)}</b>\n\n"
-    for row in rows:
-        local_time = local_from_utc_naive(row.created_at)
-        out += (
-            f"<code>{local_time:%d.%m %H:%M}</code> · "
-            f"<b>{escape_html(row.category)}</b> · "
-            f"{escape_html(row.text_preview or '—')}\n"
-        )
-    return out
+def activity_score(user: dict, active_days: int) -> float:
+    return (user["loops"] * 3 + user["zips"] * 2 + user["files"] * 1.5
+            + user["opportunities"] * 2 + user["media"]
+            + user["messages"] * 0.25 + active_days)
 
 
-async def build_notes_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    rows = (
-        await session.execute(
-            select(Note).where(Note.user_id == uid).order_by(Note.created_at.desc()).limit(20)
-        )
-    ).scalars().all()
-    out = f"📝 <b>Notes: {escape_html(name)}</b> ({len(rows)})\n\n"
-    if not rows:
-        return out + "Empty"
-    for row in rows:
-        out += f"• {short_date(row.created_at)} — {escape_html(row.text or '—')}\n"
-    return out
 
-
-async def build_history_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    rows = (
-        await session.execute(
-            select(MonthlySnapshot)
-            .where(MonthlySnapshot.user_id == uid)
-            .order_by(MonthlySnapshot.period.desc())
-        )
-    ).scalars().all()
-    out = f"🗂 <b>History: {escape_html(name)}</b>\n\n"
-    if not rows:
-        return out + "No monthly archives yet"
-    for row in rows:
-        files = getattr(row, "files", 0) or 0
-        out += (
-            f"• {row.period} — total <b>{row.total}</b> "
-            f"(M {row.messages} / L {row.loops} / Z {row.zips} / F {files} / PV {row.media}"
-            f" / Opp {row.opportunities}) · days {row.active_days}\n"
-        )
-    return out
-
-
-async def build_places_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    p = await placement_progress(session, uid)
-    rows = (
-        await session.execute(
-            select(Placement)
-            .where(Placement.user_id == uid)
-            .order_by(Placement.created_at.desc())
-            .limit(20)
-        )
-    ).scalars().all()
-
-    ready = ""
-    if p["ready_big"]:
-        ready = "✅ Ready via Big"
-    elif p["ready_small"]:
-        ready = "✅ Ready via Small"
-    else:
-        need_s = max(0, p["small_target"] - p["small_raw"])
-        ready = f"⏳ Need {need_s} Small or 1 Big"
-
-    out = (
-        f"🎯 <b>Placements · {escape_html(name)}</b>\n\n"
-        f"<b>ALL TIME</b>\n"
-        f"Small: <b>{p['small']}</b> · Big: <b>{p['large']}</b> · Total: <b>{p['total']}</b>\n\n"
-        f"<b>CURRENT ROLE CYCLE</b>\n"
-        f"Small: <b>{p['small_since']}/{p['small_target']}</b> "
-        f"(raw {p['small_raw']})\n"
-        f"Big: <b>{p['large_since']}/{p['large_target']}</b> "
-        f"(raw {p['large_raw']})\n"
-        f"{ready}\n"
-    )
-    if p["small_reset_at"]:
-        out += f"\nSmall reset: <code>{format_local(p['small_reset_at'])}</code>"
-    if p["large_reset_at"]:
-        out += f"\nBig reset: <code>{format_local(p['large_reset_at'])}</code>"
-
-    out += "\n\n<b>History</b>\n"
-    if not rows:
-        out += "Empty"
-    else:
-        for row in rows:
-            tier = "🟣 BIG" if row.tier == "large" else "⚪️ small"
-            body = ""
-            if row.artist or row.track:
-                body = f"{row.artist or '—'} — {row.track or '—'}"
-            elif row.comment:
-                body = row.comment
-            else:
-                body = "placement"
-            out += f"• {short_date(row.created_at)} {tier} — {escape_html(body)}\n"
-    out += "\n<i>/role @user small|big — confirm role &amp; reset cycle</i>"
-    return out
-
-
-async def build_role_dashboard(session: AsyncSession) -> str:
-    """Ready / almost / progress board based on current cycle."""
-    # Collect users who have any placements
-    uid_rows = (await session.execute(select(Placement.user_id).distinct())).scalars().all()
-    if not uid_rows:
-        return "🎖 <b>Placement roles</b>\n\nПока нет placements."
-
-    ready: list[tuple[str, dict]] = []
-    almost: list[tuple[str, dict]] = []
-    progress: list[tuple[str, dict]] = []
-
-    for uid in uid_rows:
-        p = await placement_progress(session, uid)
-        name = await resolve_name(session, uid) or f"ID {uid}"
-        entry = (name, p)
-        if p["ready"]:
-            ready.append(entry)
-        elif p["small_raw"] >= max(1, p["small_target"] - 1) or p["large_raw"] >= 1:
-            almost.append(entry)
-        elif p["total"] > 0:
-            progress.append(entry)
-
-    def sort_key(item):
-        _, p = item
-        # nearest to goal first
-        need_s = max(0, p["small_target"] - p["small_raw"])
-        need_b = max(0, p["large_target"] - p["large_raw"])
-        return (min(need_s, need_b * 3), -p["total"])
-
-    ready.sort(key=lambda x: -x[1]["total"])
-    almost.sort(key=sort_key)
-    progress.sort(key=sort_key)
-
-    out = "🎖 <b>Placement role board</b>\n\n"
-    if ready:
-        out += "<b>✅ Ready</b>\n"
-        for name, p in ready[:15]:
-            via = "Big" if p["ready_big"] else "Small"
-            out += (
-                f"• <b>{escape_html(name)}</b> — via {via} · "
-                f"S {p['small_since']}/{p['small_target']} · B {p['large_since']}/{p['large_target']} "
-                f"(all-time {p['total']})\n"
-            )
-        out += "\n"
-    if almost:
-        out += "<b>🟡 Almost</b>\n"
-        for name, p in almost[:10]:
-            out += (
-                f"• <b>{escape_html(name)}</b> — "
-                f"S {p['small_since']}/{p['small_target']} · B {p['large_since']}/{p['large_target']} "
-                f"(all-time {p['total']})\n"
-            )
-        out += "\n"
-    if progress:
-        out += "<b>⏳ Progress</b>\n"
-        for name, p in progress[:10]:
-            out += (
-                f"• <b>{escape_html(name)}</b> — "
-                f"S {p['small_since']}/{p['small_target']} · B {p['large_since']}/{p['large_target']} "
-                f"(all-time {p['total']})\n"
-            )
-    if not ready and not almost and not progress:
-        out += "Нет данных."
-    out += "\n<i>Role is manual. /role resets the cycle after you grant it.</i>"
-    return out
-
-
-async def build_roles_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    p = await placement_progress(session, uid)
-    out = (
-        f"🎖 <b>Placement Role · {escape_html(name)}</b>\n\n"
-        f"<b>ALL TIME</b>\n"
-        f"Small: <b>{p['small']}</b> · Big: <b>{p['large']}</b> · Total: <b>{p['total']}</b>\n\n"
-        f"<b>CURRENT ROLE CYCLE</b>\n"
-        f"Small · <b>{p['small_since']}/{p['small_target']}</b> (raw {p['small_raw']})\n"
-        f"Big · <b>{p['large_since']}/{p['large_target']}</b> (raw {p['large_raw']})\n"
-    )
-    if p["ready_big"]:
-        out += "\n✅ Ready via Big"
-    elif p["ready_small"]:
-        out += "\n✅ Ready via Small"
-    else:
-        out += f"\n⏳ Next: {max(0, p['small_target'] - p['small_raw'])} Small or 1 Big"
-    if p["small_reset_at"]:
-        out += f"\n\nLast Small reset: <code>{format_local(p['small_reset_at'])}</code>"
-    if p["large_reset_at"]:
-        out += f"\nLast Big reset: <code>{format_local(p['large_reset_at'])}</code>"
-
-    awards = (
-        await session.execute(
-            select(RoleAward)
-            .where(RoleAward.user_id == uid)
-            .order_by(RoleAward.created_at.desc())
-            .limit(5)
-        )
-    ).scalars().all()
-    if awards:
-        out += "\n\n<b>Recent role confirms</b>\n"
-        for a in awards:
-            out += f"• {short_date(a.created_at)} · {a.kind.upper()} (S{a.small_count}/B{a.large_count})\n"
-
-    out += (
-        "\n\n<i>/role @user small — reset Small after manual role\n"
-        "/role @user big — reset Big after manual role</i>"
-    )
-    return out
-
-
-async def build_profile_text(session: AsyncSession, uid: int, name: str | None) -> str:
-    if not name:
-        name = await resolve_name(session, uid) or f"ID {uid}"
-    month = await get_user_stats(session, uid, "month", include_placements=True)
-    d7 = await get_user_stats(session, uid, "7d")
-    d30 = await get_user_stats(session, uid, "30d")
-    all_time = await get_user_stats(session, uid, "all")
-    p = await placement_progress(session, uid)
-
-    month_bits = metric_line(
-        [
-            ("Loops", month["loops"]),
-            ("Zips", month["zips"]),
-            ("Files", month["files"]),
-            ("Media", month["media"]),
-            ("Msg", month["messages"]),
-            ("Opps", month["opportunities"]),
-        ],
-        hide_zero=True,
-    )
-    out = (
-        f"{header('🗂', f'Profile · {escape_html(name)}')}\n\n"
-        f"<b>Этот месяц</b> · {escape_html(month['period_label'])}\n"
-        f"Total <b>{month['total']}</b> · Days <b>{month['active_days']}</b> · "
-        f"Streak <b>{month['streak']}</b>\n"
-        f"{month_bits}\n\n"
-        f"<b>7d</b>  {d7['total']} total · {d7['active_days']} days\n"
-        f"<b>30d</b> {d30['total']} total · {d30['active_days']} days\n"
-        f"<b>All</b>  {all_time['total']} total · {all_time['active_days']} days\n\n"
-        f"<b>Placements</b>  Small {p['small']} · Big {p['large']} · Total {p['total']}\n"
-        f"<b>Role cycle</b>  S {p['small_since']}/{p['small_target']} · "
-        f"B {p['large_since']}/{p['large_target']}"
-    )
-    if p["ready"]:
-        out += "\n✅ Ready for role"
-    return out
 
 
 # ============================================================
@@ -1727,11 +1402,16 @@ async def make_snapshot(session: AsyncSession) -> str:
 async def build_export(session: AsyncSession) -> BufferedInputFile:
     users = await user_pivot(session, None, utc_now())
     days = await user_days(session, None, utc_now())
-    placement_user_rows = (
-        await session.execute(select(Placement.user_id, Placement.username).distinct())
-    ).all()
-    for uid, username in placement_user_rows:
-        users.setdefault(uid, _blank_user(username))
+    from tracker_insights import member_directory
+    directory = await member_directory(sys.modules[__name__], session, page_size=2**31 - 1)
+    for member in directory["items"]:
+        users.setdefault(member["uid"], _blank_user())
+    for uid, user in users.items():
+        profile = await session.get(User, uid)
+        if profile:
+            user.update(un=profile.username, fn=profile.first_name)
+        elif not user["un"] and not user["fn"]:
+            user["un"] = await resolve_name(session, uid)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -1761,8 +1441,8 @@ async def build_export(session: AsyncSession) -> BufferedInputFile:
         writer.writerow(
             [
                 uid,
-                user["un"] or "",
-                user["fn"] or "",
+                safe_csv_cell(user["un"] or ""),
+                safe_csv_cell(user["fn"] or ""),
                 user["messages"],
                 user["loops"],
                 user["zips"],
@@ -1783,6 +1463,11 @@ async def build_export(session: AsyncSession) -> BufferedInputFile:
         buffer.getvalue().encode("utf-8-sig"),
         filename=f"301tracker_{local_now():%Y-%m-%d}.csv",
     )
+
+
+def safe_csv_cell(value: str) -> str:
+    """Prevent participant-controlled names becoming spreadsheet formulas."""
+    return "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value
 
 
 # ============================================================
@@ -1951,49 +1636,6 @@ async def cmd_roles(message: Message, session: AsyncSession, command: CommandObj
     await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "board"), bot)
 
 
-@router.message(Command("role"))
-async def cmd_role(message: Message, session: AsyncSession, command: CommandObject):
-    if not is_admin(message):
-        return
-
-    tokens = command.args.split() if command.args else []
-    if message.reply_to_message and tokens and not tokens[0].startswith("@") and not tokens[0].isdigit():
-        uid, name, error = await find_user(session, message, None)
-        kind = tokens[0].lower()
-    else:
-        if len(tokens) < 2:
-            await message.answer(
-                "Формат: /role @user small\n"
-                "или /role @user big\n"
-                "Это подтверждает ручную выдачу роли и сбрасывает соответствующую шкалу."
-            )
-            return
-        uid, name, error = await find_user(session, message, tokens[0])
-        kind = tokens[1].lower()
-
-    if error:
-        await message.answer(error)
-        return
-    if kind not in {"small", "big"}:
-        await message.answer("Укажи small или big.")
-        return
-
-    try:
-        p = await reset_placement_progress(session, uid, kind, message.from_user.id, name)
-    except ValueError as exc:
-        await message.answer(str(exc))
-        return
-    await message.answer(
-        f"✅ <b>Выдача роли подтверждена</b>\n\n"
-        f"{escape_html(name)}\n"
-        f"Роль: <b>{kind.title()}</b>\n\n"
-        f"<b>За всё время</b>\n"
-        f"Small · <b>{p['small']}</b> · Big · <b>{p['large']}</b>\n\n"
-        f"<b>Новый цикл</b>\n"
-        f"Small · <b>{p['small_since']}/{p['small_target']}</b>\n"
-        f"Big · <b>{p['large_since']}/{p['large_target']}</b>\n\n"
-        f"<i>Роль в Telegram выдаётся вручную.</i>"
-    )
 
 
 @router.message(Command("profile"))
@@ -2012,195 +1654,29 @@ async def cmd_profile(message: Message, session: AsyncSession, command: CommandO
     await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "profile", uid), bot)
 
 
-@router.message(Command("place"))
-async def cmd_place(message: Message, session: AsyncSession, command: CommandObject):
+@router.message(Command("place", "note", "role", "undo", "snapshot"))
+async def cmd_legacy_write(message: Message, session: AsyncSession, command: CommandObject, state: FSMContext, bot: Bot):
+    """Compatibility shortcuts open the same confirmed button flows."""
     if not is_admin(message):
+        await message.answer("Это действие доступно администратору.")
         return
-    if throttle(message.from_user.id):
-        await message.answer("⏳ Слишком быстро, подожди пару секунд.")
-        return
-    tokens = command.args.split() if command.args else []
-    if not tokens:
-        await message.answer(
-            "Формат:\n"
-            "/place @username small Артист | Трек\n"
-            "/place @username big текст-комментарий\n"
-            "Или ответь на сообщение: /place small Артист | Трек"
-        )
-        return
-    if message.reply_to_message and (not tokens[0].startswith("@") and not tokens[0].isdigit()):
-        uid, name, error = await find_user(session, message, None)
-        tier = tokens[0].lower()
-        payload = " ".join(tokens[1:])
-    else:
-        uid, name, error = await find_user(session, message, tokens[0])
-        tier = tokens[1].lower() if len(tokens) > 1 else "small"
-        payload = " ".join(tokens[2:])
-    if error:
-        await message.answer(error)
-        return
-    if tier in {"normal", "small"}:
-        tier = "small"
-    elif tier in {"large", "big"}:
-        tier = "large"
-    else:
-        await message.answer("Тип placement: small или big.")
-        return
-
-    payload = payload.strip()
-    artist = None
-    track = None
-    comment = None
-    if "|" in payload:
-        artist_part, track_part = payload.split("|", 1)
-        artist = artist_part.strip() or None
-        track = track_part.strip() or None
-    elif " — " in payload:
-        artist_part, track_part = payload.split(" — ", 1)
-        artist = artist_part.strip() or None
-        track = track_part.strip() or None
-    elif " - " in payload:
-        artist_part, track_part = payload.split(" - ", 1)
-        artist = artist_part.strip() or None
-        track = track_part.strip() or None
-    else:
-        comment = payload or None
-
-    if not artist and not track and not comment:
-        comment = "placement"
-
-    # Render the same bounded values that are persisted in the database.
-    artist = artist[:200] if artist else None
-    track = track[:200] if track else None
-    comment = comment[:NOTE_MAX_LEN] if comment else None
-
-    # light de-dupe: same user + same tier + same body within 2 minutes
-    recent_cut = utc_now() - timedelta(minutes=2)
-    body_check = (artist or "") + "|" + (track or "") + "|" + (comment or "")
-    recent = (
-        await session.execute(
-            select(Placement)
-            .where(
-                Placement.user_id == uid,
-                Placement.tier == tier,
-                Placement.created_at >= recent_cut,
-            )
-            .order_by(Placement.created_at.desc())
-            .limit(3)
-        )
-    ).scalars().all()
-    for r in recent:
-        prev_body = (r.artist or "") + "|" + (r.track or "") + "|" + (r.comment or "")
-        if prev_body == body_check:
-            await message.answer("⚠️ Похожая запись уже добавлена только что. Проверь /places.")
-            return
-
-    session.add(
-        Placement(
-            user_id=uid,
-            username=name,
-            tier=tier,
-            artist=(artist[:200] if artist else None),
-            track=(track[:200] if track else None),
-            comment=(comment[:NOTE_MAX_LEN] if comment else None),
-            actor_id=message.from_user.id,
-            created_at=utc_now(),
-        )
-    )
-    await session.commit()
-    p = await placement_progress(session, uid)
-
-    if artist and track:
-        details_line = f"🎤 {escape_html(artist)}\n🎵 {escape_html(track)}"
-    else:
-        details_line = f"📝 {escape_html(comment)}"
-    await message.answer(
-        f"{header('✅', 'Placement добавлен')}\n\n"
-        f"👤 {escape_html(name)}　{'🟣 BIG' if tier == 'large' else '⚪️ small'}\n"
-        f"{details_line}\n\n"
-        f"<b>За всё время</b>: Small {p['small']} · Big {p['large']} · Всего {p['total']}\n"
-        f"<b>Текущий цикл</b>: Small {p['small_since']}/{p['small_target']} · "
-        f"Big {p['large_since']}/{p['large_target']}"
-        + ("\n✅ Порог роли достигнут" if p["ready"] else "")
-    )
-
-
-@router.message(Command("note"))
-async def cmd_note(message: Message, session: AsyncSession, command: CommandObject):
-    if not is_admin(message):
-        return
-    if throttle(message.from_user.id):
-        await message.answer("⏳ Слишком быстро, подожди пару секунд.")
-        return
-    tokens = command.args.split() if command.args else []
-    if not tokens:
-        await message.answer("Формат: /note @username текст\nИли ответь на сообщение: /note текст")
-        return
-
-    if message.reply_to_message and not tokens[0].startswith("@") and not tokens[0].isdigit():
-        uid, name, error = await find_user(session, message, None)
-        note_text = " ".join(tokens)
-    else:
-        uid, name, error = await find_user(session, message, tokens[0])
-        note_text = " ".join(tokens[1:])
-
-    if error:
-        await message.answer(error)
-        return
-    if not note_text:
-        await message.answer("❗ Текст заметки пустой.")
-        return
-
-    session.add(
-        Note(
-            user_id=uid,
-            username=name,
-            text=note_text[:NOTE_MAX_LEN],
-            actor_id=message.from_user.id,
-            created_at=utc_now(),
-        )
-    )
-    await session.commit()
-    await message.answer(f"📝 Заметка сохранена: {escape_html(name)}")
-
-
-@router.message(Command("undo"))
-async def cmd_undo(message: Message, session: AsyncSession):
-    if not is_admin(message):
-        return
-    actor_id = message.from_user.id
-    cutoff = utc_now() - timedelta(minutes=UNDO_WINDOW_MINUTES)
-
-    last_note = await session.scalar(
-        select(Note)
-        .where(Note.actor_id == actor_id, Note.created_at >= cutoff)
-        .order_by(Note.created_at.desc(), Note.id.desc())
-        .limit(1)
-    )
-    last_placement = await session.scalar(
-        select(Placement)
-        .where(Placement.actor_id == actor_id, Placement.created_at >= cutoff)
-        .order_by(Placement.created_at.desc(), Placement.id.desc())
-        .limit(1)
-    )
-    candidates = [x for x in [last_note, last_placement] if x]
-    if not candidates:
-        await message.answer(f"Нечего отменять за последние {UNDO_WINDOW_MINUTES} минут.")
-        return
-    target = max(candidates, key=lambda x: (x.created_at, x.id))
-    if isinstance(target, Placement) and not await placement_can_be_undone(session, target):
-        await message.answer("По этому плейсменту уже подтверждена роль. Отмена недоступна.")
-        return
-
-    if isinstance(target, Note):
-        preview = f"NOTE · {target.username or target.user_id} · {target.text or '—'}"
-    else:
-        body = target.comment or f"{target.artist or ''} {target.track or ''}".strip() or "placement"
-        preview = f"PLACEMENT · {target.username or target.user_id} · {target.tier} · {body}"
-
-    await session.delete(target)
-    await session.commit()
-    await message.answer(f"↩️ Отменено:\n<code>{escape_html(preview[:200])}</code>")
+    await state.clear()
+    view = "service" if command.command == "snapshot" else "admin"
+    uid = message.from_user.id
+    if command.command in {"place", "note", "role"}:
+        tokens = command.args.split() if command.args else []
+        raw = tokens[0] if tokens and (tokens[0].startswith("@") or tokens[0].isdigit()) else None
+        if not raw and not message.reply_to_message:
+            view = "members"
+        else:
+            uid, name, error = await find_user(session, message, raw)
+            if error:
+                await message.answer(error)
+                return
+            view = "roles" if command.command == "role" else "profile"
+    screen = await build_screen(sys.modules[__name__], session, message.from_user.id, view, uid)
+    screen.text = "Выбери действие кнопкой ниже. Изменения сохраняются после подтверждения.\n\n" + screen.text
+    await deliver(message, screen, bot)
 
 
 async def placement_can_be_undone(session: AsyncSession, placement: Placement) -> bool:
@@ -2247,12 +1723,6 @@ async def cmd_setreport(message: Message, session: AsyncSession):
     await message.answer(f"✅ Отчёт настроен: каждый понедельник в 12:00 по {BOT_TIMEZONE}.")
 
 
-@router.message(Command("snapshot"))
-async def cmd_snapshot(message: Message, session: AsyncSession):
-    if not is_admin(message):
-        return
-    period = await make_snapshot(session)
-    await message.answer(f"📸 Архив за <b>{period}</b> сохранён.")
 
 
 @router.message(Command("health"))
@@ -2535,7 +2005,7 @@ async def snapshot_loop() -> None:
 async def setup_commands(bot: Bot) -> None:
     public = [
         BotCommand(command="menu", description="Открыть меню"),
-        BotCommand(command="my", description="Моя статистика"),
+        BotCommand(command="my", description="Моя активность"),
         BotCommand(command="profile", description="Мой профиль"),
         BotCommand(command="help", description="Помощь"),
     ]
