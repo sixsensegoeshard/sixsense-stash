@@ -52,7 +52,7 @@ from aiogram.types import (
     Message,
     TelegramObject,
 )
-from tracker_ui import build_screen, deliver, register_ui, short
+from tracker_ui import build_screen, deliver, register_ui, short, number, plural
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -1249,7 +1249,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"Нет активности за {escape_html(label)}."
+        return f"🏆 <b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности."
 
     def metric(uid, user, active_days):
         if sort == "days":
@@ -1301,9 +1301,11 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     out = f"{header('🏆', f'Рейтинг · {labels.get(sort, sort)}')}\n<i>{escape_html(label)}</i>\n\n"
     for idx, (uid, user) in enumerate(current, start=1):
         marker = medals[idx - 1] if idx <= 3 else f"{idx}."
-        name = escape_html(short(display_name(user["un"], user["fn"]), 55))
+        name = escape_html(short(display_name(user["un"], user["fn"]), 36))
         value = metric(uid, user, days)
-        out += f"{marker} {name} — <b>{value:g}</b> {arrows.get(uid, '')}\n"
+        shown = number(int(value)) if value == int(value) else f"{value:g}".replace(".", ",")
+        unit = " баллов" if sort == "contribution" else " дн." if sort == "days" else ""
+        out += f"{marker} <b>{name}</b>\n{shown}{unit} {arrows.get(uid, '')}\n\n"
     if sort == "contribution":
         out += "\n<i>Баллы: луп 3 · архив 2 · файл 1,5 · возможность 2 · медиа 1 · сообщение 0,25 · активный день 1. "
         out += "Это объём вклада, а не оценка качества музыки.</i>"
@@ -1327,7 +1329,7 @@ async def build_weekly_report(session: AsyncSession) -> str | None:
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"{header('📋', 'Отчёт за неделю')}\n<i>{label}</i>\n\nЗа этот период ещё нет активности."
+        return f"{header('📋', 'Прошлая неделя')}\n<i>{label}</i>\n\nЗа этот период ещё нет активности."
 
     ranked = sorted(users.items(), key=lambda item: item[1]["total"], reverse=True)[:10]
     loop_leader = max(users.items(), key=lambda item: item[1]["loops"])
@@ -1338,10 +1340,11 @@ async def build_weekly_report(session: AsyncSession) -> str | None:
     opp_leader = max(users.items(), key=lambda item: item[1]["opportunities"])
 
     medals = ["🥇", "🥈", "🥉"]
-    out = f"{header('📋', 'Отчёт за неделю')}\n<i>{label}</i>\n\n"
+    out = f"{header('📋', 'Прошлая неделя')}\n<i>{label}</i>\n\n"
     for idx, (uid, user) in enumerate(ranked, start=1):
         marker = medals[idx - 1] if idx <= 3 else f"{idx}."
-        out += f"{marker} {escape_html(short(display_name(user['un'], user['fn']), 55))} — <b>{user['total']}</b>\n"
+        out += (f"{marker} <b>{escape_html(short(display_name(user['un'], user['fn']), 36))}</b>\n"
+                f"{number(user['total'])} {plural(user['total'], 'действие', 'действия', 'действий')}\n\n")
 
     extras = []
     if loop_leader[1]["loops"]:

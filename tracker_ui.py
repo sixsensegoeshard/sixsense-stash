@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import json
 import secrets
+import unicodedata
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any
@@ -74,7 +75,60 @@ class Screen:
 
 def short(value: Any, limit: int = 160) -> str:
     text = " ".join(str(value or "").split())
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+    if text_units(text) <= limit:
+        return text
+    clusters = []
+    for char in text:
+        joined = clusters and (unicodedata.category(char).startswith("M")
+            or char == "\u200d" or clusters[-1].endswith("\u200d")
+            or 0x1F3FB <= ord(char) <= 0x1F3FF
+            or (0x1F1E6 <= ord(char) <= 0x1F1FF and len(clusters[-1]) == 1
+                and 0x1F1E6 <= ord(clusters[-1]) <= 0x1F1FF))
+        if joined:
+            clusters[-1] += char
+        else:
+            clusters.append(char)
+    result, used = [], 0
+    for cluster in clusters:
+        size = text_units(cluster)
+        if used + size > max(0, limit - 1):
+            break
+        result.append(cluster)
+        used += size
+    return "".join(result) + "…"
+
+
+def text_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def number(value: int | float) -> str:
+    return f"{value:,}".replace(",", "\u202f")
+
+
+def plural(value: int, one: str, few: str, many: str) -> str:
+    n = abs(value)
+    return many if 11 <= n % 100 <= 14 else one if n % 10 == 1 else few if 2 <= n % 10 <= 4 else many
+
+
+def summary(total: int, days: int) -> str:
+    return (f"<b>{number(total)}</b> {plural(total, 'действие', 'действия', 'действий')} · "
+            f"{number(days)} {plural(days, 'активный день', 'активных дня', 'активных дней')}")
+
+
+def page_label(count: int, page: int, pages: int, noun: str = "записей") -> str:
+    suffix = f" · страница {page + 1}/{pages}" if pages > 1 else ""
+    return f"<i>{number(count)} {noun}{suffix}</i>"
+
+
+def month_label(period: str) -> str:
+    months = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+    try:
+        year, month = map(int, period.split("-"))
+        return f"{months[month - 1]} {year}" if 1 <= month <= 12 else period
+    except ValueError:
+        return period
 
 
 def button(owner: int, label: str, action: str, uid: int = 0, period: str = "month", extra: str = "0") -> InlineKeyboardButton:
@@ -85,11 +139,15 @@ def button(owner: int, label: str, action: str, uid: int = 0, period: str = "mon
 
 
 def keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    for row in rows:
+        for item in row:
+            item.text = short(item.text, 36 if len(row) == 1 else 22)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def period_buttons(owner: int, view: str, uid: int, selected: str, extra: str = "0") -> list[InlineKeyboardButton]:
-    return [button(owner, ("✓ " if key == selected else "") + title, view, uid, key, extra) for key, title in PERIODS.items()]
+def period_buttons(owner: int, view: str, uid: int, selected: str, extra: str = "0") -> list[list[InlineKeyboardButton]]:
+    buttons = [button(owner, ("✓ " if key == selected else "") + title, view, uid, key, extra) for key, title in PERIODS.items()]
+    return [buttons[:2], buttons[2:]]
 
 
 def progress_bar(value: int, target: int) -> str:
@@ -99,20 +157,20 @@ def progress_bar(value: int, target: int) -> str:
 
 def stats_card(name: str, s: dict) -> str:
     lines = [
-        "📊 <b>Статистика активности</b>", escape(short(name, 80)),
+        "📊 <b>Статистика активности</b>", escape(short(name, 48)),
         f"<i>{escape(s['period_label'])}</i>", "",
-        f"<b>{s['total']:,}</b> действий · <b>{s['active_days']}</b> активных дней",
+        summary(s["total"], s["active_days"]),
     ]
     values = [("Лупы", "loops"), ("Архивы", "zips"), ("Файлы", "files"), ("Медиа", "media"), ("Сообщения", "messages")]
-    nonzero = [f"{label}  <b>{s[key]:,}</b>" for label, key in values if s[key]]
+    nonzero = [f"{label} — <b>{number(s[key])}</b>" for label, key in values if s[key]]
     if nonzero:
         lines += [""] + nonzero
     else:
         lines += ["", "Пока нет активности за этот период.", "Сообщения в подключённой группе появятся здесь автоматически."]
     if s["opportunities"]:
-        lines += [f"Возможности  <b>{s['opportunities']}</b>"]
-    lines += ["", f"🔥 Текущая серия: <b>{s['streak']}</b> дн."]
-    lines += ["<i>Одно сообщение или вложение = одно действие. Плейсменты учитываются отдельно.</i>"]
+        lines += [f"С тегом возможности — <b>{number(s['opportunities'])}</b>"]
+    if s["streak"]:
+        lines += ["", f"🔥 <b>{s['streak']}</b> {plural(s['streak'], 'день', 'дня', 'дней')} подряд"]
     return "\n".join(lines)
 
 
@@ -121,13 +179,15 @@ def roles_card(name: str, p: dict) -> str:
     need_s = max(0, p["small_target"] - p["small_raw"])
     need_b = max(0, p["large_target"] - p["large_raw"])
     return (
-        f"🎖 <b>Прогресс к роли</b>\n{escape(short(name, 80))}\n\n"
-        f"Small  <b>{p['small_raw']}/{p['small_target']}</b>\n{progress_bar(p['small_raw'], p['small_target'])}\n\n"
-        f"Big  <b>{p['large_raw']}/{p['large_target']}</b>\n{progress_bar(p['large_raw'], p['large_target'])}\n\n"
-        f"{'✅' if p['ready'] else '◷'} {status}\n"
+        f"🎖 <b>Прогресс к роли</b>\n{escape(short(name, 48))}\n\n"
+        f"Small — <b>{p['small_since']} / {p['small_target']}</b>\n{progress_bar(p['small_raw'], p['small_target'])}\n"
+        + (f"<i>{p['small_raw']} в текущем цикле</i>\n" if p['small_raw'] > p['small_target'] else "")
+        + f"\nBig — <b>{p['large_since']} / {p['large_target']}</b>\n{progress_bar(p['large_raw'], p['large_target'])}\n"
+        + (f"<i>{p['large_raw']} в текущем цикле</i>\n" if p['large_raw'] > p['large_target'] else "")
+        + "\n"
+        + f"{'✅' if p['ready'] else '◷'} {status}\n"
         + ("" if p["ready"] else f"До порога: {need_s} Small или {need_b} Big.\n")
-        + f"\nВсего плейсментов: <b>{p['total']}</b> · Small {p['small']} · Big {p['large']}\n"
-        "<i>После ручной выдачи роли администратор подтверждает её здесь.</i>"
+        + "\n<i>Для порога достаточно одной из шкал. Роль в группе выдаёт администратор.</i>"
     )
 
 
@@ -193,9 +253,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         s = await app.get_user_stats(session, owner, "month")
         text = (
             "<b>301 / TRACKER</b>\n<i>Активность · плейсменты · прогресс</i>\n\n"
-            f"Привет, {escape(short(name, 60))}.\n"
-            f"В этом месяце: <b>{s['total']:,}</b> действий · <b>{s['active_days']}</b> активных дней.\n\n"
-            "Выбери раздел ниже."
+            f"{escape(short(name, 48))}\n\n"
+            f"<b>Этот месяц</b>\n{summary(s['total'], s['active_days'])}"
         )
         rows = [[button(owner, "📊 Моя активность", "stats", owner), button(owner, "👤 Мой профиль", "profile", owner)]]
         if admin:
@@ -207,32 +266,53 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         s = await app.get_user_stats(session, uid, period)
         text = stats_card(name, s)
         comparison = await activity_comparison(app, session, uid, period)
-        if comparison:
+        if comparison and (comparison["current"] or comparison["previous"]):
             current, previous = comparison["current"], comparison["previous"]
             delta = current - previous
-            change = f"{delta:+,}" if previous else ("новая активность" if current else "без изменений")
-            text += f"\n\n{escape(comparison['label'])}: <b>{previous:,} → {current:,}</b> · {change}"
-        rows = [period_buttons(owner, view, uid, period)]
+            if previous:
+                percent = comparison["percent"]
+                percent_text = f"{percent:+.0f}%" if abs(percent) >= 1 else f"{percent:+.1f}%".replace(".", ",")
+                change = f"{'+' if delta > 0 else ''}{number(delta)} · {percent_text}"
+            else:
+                change = "Раньше активности не было"
+            comparison_label = {"7d": "С предыдущими 7 днями", "30d": "С предыдущими 30 днями",
+                                "month": "За тот же отрезок прошлого месяца"}[period]
+            text += f"\n\n<b>Динамика</b>\n{change}\n<i>{comparison_label}</i>"
+        rows = period_buttons(owner, view, uid, period)
     elif view == "profile":
         month = await app.get_user_stats(session, uid, "month")
         p = await app.placement_progress(session, uid)
+        activity_where = (app.MsgLog.user_id == uid) & (app.MsgLog.created_at < app.utc_now())
+        if app.TRACK_CHAT_ID is not None:
+            activity_where &= app.MsgLog.chat_id == app.TRACK_CHAT_ID
+        has_messages = bool(await session.scalar(select(app.MsgLog.id).where(activity_where).limit(1)))
         text = (
-            f"👤 <b>{escape(short(name, 80))}</b>\n<i>Плейсменты и прогресс к роли</i>\n\n"
-            f"<b>{p['total']}</b> плейсментов за всё время\nSmall {p['small']} · Big {p['large']}\n\n"
+            f"👤 <b>Профиль</b>\n{escape(short(name, 36))}\n<i>Плейсменты и прогресс к роли</i>\n\n"
+            f"<b>{number(p['total'])}</b> {plural(p['total'], 'плейсмент', 'плейсмента', 'плейсментов')} за всё время\n"
+            f"Small — {number(p['small'])} · Big — {number(p['large'])}\n\n"
             f"{'✅ Порог для роли достигнут' if p['ready'] else '🎖 Текущий прогресс'}\n"
-            f"Small <b>{p['small_raw']}/{p['small_target']}</b> · Big <b>{p['large_raw']}/{p['large_target']}</b>\n"
-            f"<i>Для порога достаточно {p['small_target']} Small или {p['large_target']} Big. "
-            "После подтверждения роли начинается новый цикл соответствующей шкалы.</i>\n\n"
-            f"Активность за месяц: {month['total']:,} действий · {month['active_days']} дн.\n"
-            f"🔥 Текущая серия: {month['streak']} дн."
+            f"Small <b>{p['small_since']} / {p['small_target']}</b> · Big <b>{p['large_since']} / {p['large_target']}</b>\n\n"
+            f"<b>Активность за месяц</b>\n{summary(month['total'], month['active_days'])}"
         )
-        rows = [[button(owner, "🎯 Плейсменты", "places", uid), button(owner, "🎖 Прогресс роли", "roles", uid)],
-                [button(owner, "📊 Активность", "stats", uid), button(owner, "🗓 По месяцам", "history", uid)]]
+        role_actions = [button(owner, "🎖 Прогресс роли", "roles", uid)]
+        if p["total"]:
+            role_actions.insert(0, button(owner, "🎯 Плейсменты", "places", uid))
+        activity_actions = [button(owner, "📊 Активность", "stats", uid)]
+        has_archive = bool(await session.scalar(select(app.MonthlySnapshot.id).where(app.MonthlySnapshot.user_id == uid).limit(1)))
+        if has_messages or has_archive:
+            activity_actions.append(button(owner, "🗓 По месяцам", "history", uid))
+        rows = [role_actions, activity_actions]
         if admin:
-            rows += [[button(owner, "＋ Плейсмент", "addplace", uid), button(owner, "＋ Заметка", "addnote", uid)],
-                     [button(owner, "📝 Заметки", "notes", uid), button(owner, "🕓 Последние сообщения", "last", uid)],
-                     [button(owner, "🧾 История изменений", "changes", uid)],
-                     [button(owner, "‹ Участники", "members", extra="recent.0")]]
+            rows += [[button(owner, "＋ Плейсмент", "addplace", uid), button(owner, "＋ Заметка", "addnote", uid)]]
+            records = []
+            if await session.scalar(select(app.Note.id).where(app.Note.user_id == uid).limit(1)):
+                records.append(button(owner, "📝 Заметки", "notes", uid))
+            if has_messages:
+                records.append(button(owner, "🕓 Сообщения", "last", uid))
+            if records:
+                rows += [records]
+            if await session.scalar(select(app.RecordChange.id).where(app.RecordChange.user_id == uid).limit(1)):
+                rows += [[button(owner, "🧾 История изменений", "changes", uid)]]
     elif view == "roles":
         p = await app.placement_progress(session, uid)
         text = roles_card(name, p)
@@ -254,11 +334,11 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         history = await monthly_history(app, session, uid)
         pages = max(1, math.ceil(len(history) / PAGE_SIZE))
         page = max(0, min(int(extra), pages - 1))
-        text = f"🗓 <b>Активность по месяцам</b>\n{escape(short(name, 80))}\n"
+        text = f"🗓 <b>Активность по месяцам</b>\n{escape(short(name, 48))}\n"
         if not history:
             text += "\nПока нет активности. Здесь появятся месяцы с сообщениями в группе."
         for item in history[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
-            text += f"\n<b>{item['period']}</b> · {item['total']:,} действий · {item['active_days']} дн.\n"
+            text += f"\n<b>{escape(month_label(item['period']))}</b>\n{summary(item['total'], item['active_days'])}\n"
             counts = [f"{label} {item[key]}" for key, label in (("loops", "Лупы"), ("zips", "Архивы"),
                       ("files", "Файлы"), ("media", "Медиа"), ("messages", "Сообщения")) if item[key]]
             text += " · ".join(counts) + "\n"
@@ -272,24 +352,26 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             where = where & (model.chat_id == app.TRACK_CHAT_ID)
         items, count, page, pages = await page_rows(session, model, where, [model.created_at.desc(), model.id.desc()], page)
         title = {"places": "🎯 Плейсменты", "notes": "📝 Заметки", "last": "🕓 Последние сообщения", "changes": "🧾 История изменений"}[view]
-        text = f"<b>{title}</b>\n{escape(short(name, 80))}\n<i>{count} записей · страница {page + 1}/{pages}</i>\n"
+        text = f"<b>{title}</b>\n{escape(short(name, 48))}\n"
+        if count:
+            text += page_label(count, page, pages) + "\n"
         if not items:
             text += "\nПока нет записей."
         for idx, item in enumerate(items, start=page * PAGE_SIZE + 1):
             if view in {"places", "notes"}:
                 kind = "place" if view == "places" else "note"
                 label = f"{idx}. {app.short_date(item.created_at)}" + (f" · {'Big' if item.tier == 'large' else 'Small'}" if kind == "place" else "")
-                text += f"\n<b>{label}</b>\n{escape(short(entry_body(item, kind), 240))}\n"
-                rows += [[button(owner, label + " · Открыть", "rec", uid, extra=record_key(kind, item.id))]]
+                text += f"\n<b>{label}</b>\n{escape(short(entry_body(item, kind), 96))}\n"
+                rows += [[button(owner, f"{idx}. Открыть", "rec", uid, extra=record_key(kind, item.id))]]
             elif view == "changes":
                 labels = {"edit": "Исправлено", "delete": "Удалено", "restore": "Восстановлено"}
                 actor_name = await app.resolve_name(session, item.actor_id) or f"ID {item.actor_id}"
-                text += f"\n<b>{app.format_local(item.created_at)} · {labels.get(item.action, item.action)}</b>\n"
-                text += f"{'Плейсмент' if item.record_kind == 'place' else 'Заметка'} · {escape(short(actor_name, 50))}\n"
+                text += f"\n<b>{labels.get(item.action, item.action)}</b> · {app.short_date(item.created_at)}\n"
+                text += f"{'Плейсмент' if item.record_kind == 'place' else 'Заметка'} · {escape(short(actor_name, 36))}\n"
                 rows += [[button(owner, f"Изменение #{item.id}", "change", uid, extra=str(item.id))]]
             else:
                 category = CATEGORIES.get(item.category, "Файл")
-                text += f"\n<b>{app.format_local(item.created_at)} · {category}</b>\n{escape(short(item.text_preview, 240))}\n"
+                text += f"\n<b>{category}</b> · {app.format_local(item.created_at)}\n{escape(short(item.text_preview, 96))}\n"
         if view == "places" and admin:
             rows += [[button(owner, "＋ Плейсмент", "addplace", uid)]]
         if view == "notes":
@@ -308,7 +390,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             text = "Эта запись уже удалена. Открой список заново."
         else:
             title = "🎯 Плейсмент" if kind == "place" else "📝 Заметка"
-            text = f"<b>{title}</b>\n{escape(short(name, 80))}\n{app.format_local(item.created_at)}\n\n"
+            text = f"<b>{title}</b>\n{escape(short(name, 48))}\n<i>{app.format_local(item.created_at)}</i>\n\n"
             if kind == "place":
                 text += f"<b>{'Big' if item.tier == 'large' else 'Small'}</b>\n"
             text += escape(entry_body(item, kind))
@@ -321,7 +403,6 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                     rows += [[button(owner, "Изменить Small / Big", "tier", uid, extra=key)]]
             elif admin:
                 text += "\n\n🔒 По этой записи уже подтверждена роль. Изменение недоступно."
-        rows += [[button(owner, "‹ Плейсменты" if kind == "place" else "‹ Заметки", "places" if kind == "place" else "notes", uid)]]
     elif view == "change":
         item = await session.get(app.RecordChange, int(extra))
         if not item or item.user_id != uid:
@@ -342,7 +423,6 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             else:
                 text += "\n\nЗапись удалена. Восстановление вернёт исходные дату и содержание."
                 rows += [[button(owner, "Восстановить запись", "restore", uid, extra=str(item.id))]]
-        rows += [[button(owner, "‹ История изменений", "changes", uid)]]
     elif view == "members":
         parts = extra.split(".")
         if len(parts) > 2 and parts[2] == "0":
@@ -350,7 +430,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         sort, raw_page = (parts[0], parts[1]) if len(parts) > 1 else ("recent", extra)
         directory_nonce = parts[2] if len(parts) > 2 else ("0" if not query else secrets.token_hex(3))
         directory = await member_directory(app, session, page=int(raw_page), query=query, sort=sort)
-        text = f"👥 <b>Участники</b>\n<i>{directory['total']} в базе · страница {directory['page'] + 1}/{directory['pages']}</i>\n"
+        text = "👥 <b>Участники</b>\n" + page_label(directory["total"], directory["page"], directory["pages"], "в базе") + "\n"
         text += f"\nПоиск: <b>{escape(short(query, 80))}</b>" if query else (
             "\nСначала — недавно активные в группе." if sort == "recent" else "\nУчастники по имени.")
         if not directory["items"]:
@@ -375,38 +455,46 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         if extra not in METRICS:
             raise ValueError("Unknown metric")
         text = await app.build_top(session, extra, period)
-        rows = [period_buttons(owner, view, 0, period, extra)]
-        for keys in [("total", "contribution", "loops"), ("messages", "zips", "files"), ("media", "days", "opportunities")]:
-            rows += [[button(owner, ("✓ " if key == extra else "") + METRICS[key], view, period=period, extra=key) for key in keys]]
+        rows = period_buttons(owner, view, 0, period, extra)
+        rows += [[button(owner, "Категория · " + METRICS[extra], "metrics", period=period, extra=extra)]]
+    elif view == "metrics":
+        if extra not in METRICS:
+            raise ValueError("Unknown metric")
+        text = "🏆 <b>Категория рейтинга</b>\n\nВыбери, что сравнить."
+        for keys in [("total", "contribution"), ("loops", "zips"), ("messages", "files"), ("media", "days"), ("opportunities",)]:
+            rows += [[button(owner, ("✓ " if key == extra else "") + METRICS[key], "top", period=period, extra=key) for key in keys]]
     elif view == "admin":
-        text = "⚙️ <b>Управление</b>\n\nУчастники, роли и отчёты.\nПлейсменты и заметки добавляются из карточки участника."
-        rows = [[button(owner, "🎖 Кому доступна роль", "board", extra="ready.0"),
+        text = "⚙️ <b>Управление</b>\n\nУчастники, роли и отчёты группы."
+        rows = [[button(owner, "🎖 Готовы к роли", "board", extra="ready.0"),
                  button(owner, "📋 Отчёты", "reports")],
                 [button(owner, "👥 Найти участника", "search"), button(owner, "📤 Экспорт CSV", "export")],
-                [button(owner, "↩️ Отменить мою последнюю запись", "undo")],
                 [button(owner, "🛠 Сервис", "service")]]
+        undo_target = await last_undo_target(app, session, owner)
+        if undo_target and (isinstance(undo_target, app.Note) or await app.placement_can_be_undone(session, undo_target)):
+            rows.insert(-1, [button(owner, "↩️ Отменить последнюю запись", "undo")])
     elif view == "service":
-        text = "🛠 <b>Сервис</b>\n\nПроверка состояния, резервные копии и обслуживание данных."
+        text = "🛠 <b>Сервис</b>\n\nСостояние бота и резервные копии."
         rows = [[button(owner, "🩺 Состояние", "health"), button(owner, "💾 Копия базы", "backup")],
                 [button(owner, "Пересчитать прошлый месяц", "snapshot")]]
     elif view == "reports":
         destination = await session.get(app.Setting, "report_chat")
-        thread = await session.get(app.Setting, "report_thread")
-        text = "📋 <b>Отчёты</b>\n\nНедельный отчёт охватывает прошлую календарную неделю: понедельник — воскресенье."
+        text = "📋 <b>Отчёты</b>\n\nЗа прошлую календарную неделю: понедельник — воскресенье."
         if destination:
-            text += f"\n\n✅ Автоотчёт включён · понедельник, 12:00 ({escape(app.BOT_TIMEZONE)})."
-            text += f"\nЧат <code>{escape(destination.value)}</code> · топик <code>{escape(thread.value if thread else '0')}</code>"
+            text += f"\n\n✅ <b>Автоотчёт включён</b>\nПонедельник · 12:00\n<i>{escape(app.BOT_TIMEZONE)}</i>"
         else:
             text += "\n\nАвтоотчёт выключен."
-        text += "\n\nЧтобы выбрать место отправки, ответь <code>/setreport</code> на сообщение в нужном топике подключённой группы."
-        rows = [[button(owner, "Прошлая неделя", "report")]]
+        rows = [[button(owner, "Прошлая неделя", "report"), button(owner, "Настроить", "reportsetup")]]
         if destination:
             rows += [[button(owner, "Выключить автоотчёт", "reportoff")]]
+    elif view == "reportsetup":
+        text = ("📋 <b>Настройка автоотчёта</b>\n\n"
+                "1. Открой подключённую группу и нужный топик.\n"
+                "2. Ответь на любое сообщение командой <code>/setreport</code>.\n\n"
+                f"Отчёт придёт по понедельникам в 12:00 ({escape(app.BOT_TIMEZONE)}).")
     elif view == "help":
         text = help_card(admin)
     elif view == "report":
         text = await app.build_weekly_report(session)
-        rows += [[button(owner, "‹ Отчёты", "reports")]]
     elif view == "board":
         mode, raw_page = extra.split(".", 1) if "." in extra else ("ready", extra)
         mode = mode if mode in {"ready", "all"} else "ready"
@@ -421,13 +509,15 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         entries.sort(key=lambda item: (not item[2]["ready"], item[1].casefold(), item[0]))
         pages = max(1, math.ceil(len(entries) / 8))
         page = max(0, min(int(raw_page), pages - 1))
-        text = f"🎖 <b>{'Кому доступна роль' if mode == 'ready' else 'Прогресс ролей'}</b>\n<i>{len(entries)} участников · страница {page + 1}/{pages}</i>\n"
+        text = f"🎖 <b>{'Готовы к роли' if mode == 'ready' else 'Прогресс ролей'}</b>\n"
+        if entries:
+            text += page_label(len(entries), page, pages, "участников") + "\n"
         if not entries:
             text += "\nСейчас нет участников с достигнутым порогом." if mode == "ready" else "\nПлейсментов пока нет. Добавь первый из карточки участника."
         rows += [[button(owner, ("✓ " if mode == key else "") + label, "board", extra=f"{key}.0")
                   for key, label in (("ready", "Готовы"), ("all", "Все"))]]
         for member_id, member_name, p in entries[page * 8:(page + 1) * 8]:
-            text += f"\n{'✅' if p['ready'] else '◷'} <b>{escape(short(member_name, 45))}</b>\nSmall {p['small_raw']}/{p['small_target']} · Big {p['large_raw']}/{p['large_target']}\n"
+            text += f"\n{'✅' if p['ready'] else '◷'} <b>{escape(short(member_name, 32))}</b>\nSmall {p['small_since']} / {p['small_target']} · Big {p['large_since']} / {p['large_target']}\n"
             rows += [[button(owner, short(member_name, 45), "roles", member_id)]]
         nav = []
         if page:
@@ -442,12 +532,25 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         text = await app.build_health_text(session)
     else:
         raise ValueError("Unknown screen")
-    if view in personal | {"notes", "last", "changes"} and view != "profile":
-        rows += [[button(owner, "‹ Профиль", "profile", uid)]]
-    if view in {"board", "reports", "service", "health", "report"}:
-        rows += [[button(owner, "‹ Управление", "admin")]]
+    parents = {
+        **{key: ("‹ Профиль", "profile", uid, "0") for key in ("stats", "places", "notes", "last", "roles", "history", "changes")},
+        "rec": ("‹ Плейсменты" if kind == "place" else "‹ Заметки", "places" if kind == "place" else "notes", uid, "0") if view == "rec" else None,
+        "change": ("‹ История", "changes", uid, "0"),
+        "report": ("‹ Отчёты", "reports", 0, "0"),
+        "reportsetup": ("‹ Отчёты", "reports", 0, "0"),
+        "board": ("‹ Управление", "admin", 0, "0"),
+        "reports": ("‹ Управление", "admin", 0, "0"),
+        "service": ("‹ Управление", "admin", 0, "0"),
+        "health": ("‹ Сервис", "service", 0, "0"),
+        "metrics": ("‹ Рейтинг", "top", 0, extra),
+    }
+    if view == "profile" and admin and uid != owner:
+        parents[view] = ("‹ Участники", "members", 0, "recent.0")
     if view != "home":
-        rows += [[button(owner, "⌂ Главное меню", "home")]]
+        parent = parents.get(view)
+        navigation = [button(owner, parent[0], parent[1], parent[2], period, parent[3])] if parent else []
+        navigation += [button(owner, "⌂ Меню", "home")]
+        rows += [navigation]
     context = {"directory_query": query, "directory_nonce": directory_nonce} if view == "members" else {}
     return Screen(text, keyboard(rows), context)
 
@@ -546,7 +649,7 @@ async def _save_entry(app, session, actor: int, data: dict) -> str:
 def confirmation_text(app, data: dict) -> str:
     if data["kind"] in {"undo", "snapshot", "restore", "reportoff"}:
         return data["text"]
-    name = escape(short(data["name"], 80))
+    name = escape(short(data["name"], 48))
     if data["kind"] in {"edit", "delete"}:
         title = "Удалить запись?" if data["kind"] == "delete" else "Сохранить исправление?"
         text = f"<b>{title}</b>\n{name}\n\n<b>Сейчас</b>\n{escape(data['original'])}"

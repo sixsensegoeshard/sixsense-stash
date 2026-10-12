@@ -618,6 +618,27 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Поиск:", result.text)
         self.assertIn("22 в базе", result.text)
 
+    async def test_ranking_category_picker_preserves_selected_period(self):
+        ranking = await self.command("/top loops 7d")
+        categories = await self.click(ranking, "Категория")
+        by_files = await self.click(categories, "Файлы")
+        self.assertIn("последние 7 дней", by_files.text)
+        choices = await self.click(by_files, "Категория")
+        back = await self.click(choices, "‹ Рейтинг")
+        selected = [b.text for row in back.reply_markup.inline_keyboard for b in row]
+        self.assertIn("✓ 7 дней", selected)
+        self.assertIn("Категория · Файлы", selected)
+
+    async def test_polished_screens_have_compact_keyboards_and_single_navigation_row(self):
+        async with self.sessions() as session:
+            for view, extra in (("stats", "0"), ("top", "total"), ("metrics", "total"),
+                                ("profile", "0"), ("reports", "0"), ("reportsetup", "0"),
+                                ("roles", "0"), ("notes", "0"), ("service", "0")):
+                screen = await build_screen(app, session, 900, view, 10, extra=extra)
+                self.assertTrue(all(len(row) <= 2 for row in screen.markup.inline_keyboard), view)
+                self.assertEqual(sum(parse_payload(b.callback_data)[1] == "home"
+                                     for row in screen.markup.inline_keyboard for b in row), 1, view)
+
     async def test_group_menu_goes_to_private_chat(self):
         result = await self.command("/menu", chat_id=app.TRACK_CHAT_ID)
         self.assertIn("личные сообщения", result.text)
