@@ -129,6 +129,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats.message_id, home.message_id)
         changed = await self.click(stats, "7 дней")
         self.assertIn("последние 7 дней", changed.text)
+        selected = [b for row in changed.reply_markup.inline_keyboard for b in row if b.text == "✓ 7 дней"]
+        self.assertEqual(selected[0].style, "primary")
         self.assertEqual(changed.message_id, home.message_id)
         self.assertTrue(any(isinstance(call, AnswerCallbackQuery) for call in self.api.calls))
 
@@ -136,6 +138,21 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         stats = await self.command("/stats", actor=10)
         self.assertIn("@artist", stats.text)
         self.assertIn("Статистика", stats.text)
+
+    async def test_sparse_activity_card_stays_compact_without_empty_comparison(self):
+        now = NOW.replace(month=11, day=1)
+        with patch.object(app, "utc_now", return_value=now), patch.object(app, "local_now", return_value=app.local_from_utc_naive(now)):
+            async with self.sessions() as session:
+                for stamp in (now - timedelta(hours=1), now - timedelta(days=1)):
+                    session.add(app.MsgLog(user_id=10, chat_id=app.TRACK_CHAT_ID, category="media", created_at=stamp))
+                await session.commit()
+                screen = await build_screen(app, session, 900, "stats", 10)
+                self.assertIn("1</b> действие", screen.text)
+                self.assertIn("Серия · <b>2</b>", screen.text)
+                self.assertNotIn("<i>", screen.text)
+                self.assertNotIn("Динамика", screen.text)
+                self.assertNotIn("Раньше активности", screen.text)
+                self.assertLessEqual(len(screen.text.splitlines()), 10)
 
     async def test_profile_without_arguments_works_for_regular_user(self):
         profile = await self.command("/profile", actor=10)
@@ -171,6 +188,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         await self.click(choice, "Small")
         preview = await self.command("Artist <A> | Track & B")
         self.assertIn("&lt;A&gt;", preview.text)
+        self.assertEqual(next(b.style for row in preview.reply_markup.inline_keyboard for b in row if "Сохранить" in b.text), "success")
         async with self.sessions() as session:
             self.assertEqual(await session.scalar(select(func.count(app.Placement.id))), 0)
         saved = await self.click(preview, "Сохранить")
@@ -390,6 +408,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Заметка исправлена", saved.text)
         detail = await self.click(saved, "Открыть")
         deletion = await self.click(detail, "Удалить")
+        self.assertEqual(next(b.style for row in deletion.reply_markup.inline_keyboard for b in row if "Подтвердить" in b.text), "danger")
         async with self.sessions() as session:
             self.assertEqual(await session.scalar(select(func.count(app.Note.id))), 1)
         await self.click(deletion, "Подтвердить")

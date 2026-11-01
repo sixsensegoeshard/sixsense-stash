@@ -1255,7 +1255,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"<b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности."
+        return f"🏆 <b>Рейтинг</b>\n{escape_html(label)}\n\nПока нет активности."
 
     def metric(uid, user, active_days):
         if sort == "days":
@@ -1272,7 +1272,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
 
     users = {uid: user for uid, user in users.items() if metric(uid, user, days) > 0}
     if not users:
-        return f"<b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности в этой категории."
+        return f"🏆 <b>Рейтинг</b>\n{escape_html(label)}\n\nПока нет активности в этой категории."
     current = sorted(users.items(), key=sort_key, reverse=True)[:10]
     arrows: dict[int, str] = {}
     if period in {"7d", "30d"}:
@@ -1303,9 +1303,9 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
         "loops": "Лупы", "zips": "Архивы", "files": "Файлы",
         "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности", "contribution": "По вкладу",
     }
-    out = f"<b>Рейтинг</b>\n<i>{escape_html(labels.get(sort, sort))} · {escape_html(label)}</i>\n\n"
+    out = f"🏆 <b>Рейтинг</b>\n{escape_html(labels.get(sort, sort))} · {escape_html(label)}\n\n"
     for idx, (uid, user) in enumerate(current, start=1):
-        marker = f"{idx}."
+        marker = ("🥇", "🥈", "🥉")[idx - 1] if idx <= 3 else f"{idx}."
         name = escape_html(short(display_name(user["un"], user["fn"]), 36))
         value = metric(uid, user, days)
         shown = number(int(value)) if value == int(value) else f"{value:g}".replace(".", ",")

@@ -52,7 +52,8 @@ def parse_record_key(value: str) -> tuple[str, int, str]:
 def draft_buttons(owner: int, data: dict) -> InlineKeyboardMarkup:
     nonce = data["nonce"]
     label = "✓ Сохранить" if data["kind"] in {"place", "note", "edit"} else "✓ Подтвердить"
-    rows = [[button(owner, label, "save", extra=nonce)]]
+    save_style = "danger" if data["kind"] in {"delete", "undo", "reportoff"} else "success"
+    rows = [[button(owner, label, "save", extra=nonce, style=save_style)]]
     if data["kind"] in {"place", "note", "edit"} and not data.get("tier_only"):
         rows += [[button(owner, "✎ Изменить текст", "revise", extra=nonce)]]
     rows += [[button(owner, "Отмена", "cancel", data.get("uid", owner), extra=nonce)]]
@@ -117,12 +118,22 @@ def plural(value: int, one: str, few: str, many: str) -> str:
 
 def summary(total: int, days: int) -> str:
     return (f"<b>{number(total)}</b> {plural(total, 'действие', 'действия', 'действий')} · "
-            f"{number(days)} {plural(days, 'активный день', 'активных дня', 'активных дней')}")
+            f"<b>{number(days)}</b> {plural(days, 'активный день', 'активных дня', 'активных дней')}")
+
+
+def metric_panel(content: str) -> str:
+    return f"<blockquote>{content}</blockquote>"
 
 
 def card_title(text: str, subtitle: str = "") -> str:
-    """One quiet hierarchy for every Telegram card; no space-based alignment."""
-    return f"<b>{escape(text)}</b>" + (f"\n<i>{escape(short(subtitle, 48))}</i>" if subtitle else "")
+    """Telegram-native accents; names stay upright and easy to read."""
+    icons = {"Статистика активности": "📊", "Профиль": "👤", "Прогресс к роли": "🎖",
+             "Плейсменты": "🎯", "Плейсмент": "🎯", "Заметки": "📝", "Заметка": "📝",
+             "Действия с профилем": "⚙️", "По месяцам": "🗓", "Последние сообщения": "🕓",
+             "История изменений": "🧾", "Участники": "👥", "Управление": "⚙️",
+             "Сервис": "🛠", "Отчёты": "📋", "Помощь": "💡"}
+    heading = f"{icons[text]} {text}" if text in icons else text
+    return f"<b>{escape(heading)}</b>" + (f"\n{escape(short(subtitle, 48))}" if subtitle else "")
 
 
 def page_label(count: int, page: int, pages: int, noun: str = "записей") -> str:
@@ -140,11 +151,13 @@ def month_label(period: str) -> str:
         return period
 
 
-def button(owner: int, label: str, action: str, uid: int = 0, period: str = "month", extra: str = "0") -> InlineKeyboardButton:
+def button(owner: int, label: str, action: str, uid: int = 0, period: str = "month", extra: str = "0", *, style: str | None = None) -> InlineKeyboardButton:
     data = f"ui:{owner}:{action}:{uid}:{period}:{extra}"
     if len(data.encode()) > 64:
         raise ValueError("Callback exceeds Telegram's 64-byte limit")
-    return InlineKeyboardButton(text=label, callback_data=data)
+    accents = {"addplace": "primary", "search": "primary", "del": "danger", "reportoff": "danger",
+               "awardsmall": "success", "awardbig": "success"}
+    return InlineKeyboardButton(text=label, callback_data=data, style=style or accents.get(action))
 
 
 def keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
@@ -155,7 +168,8 @@ def keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
 
 
 def period_buttons(owner: int, view: str, uid: int, selected: str, extra: str = "0") -> list[list[InlineKeyboardButton]]:
-    buttons = [button(owner, ("✓ " if key == selected else "") + title, view, uid, key, extra) for key, title in PERIODS.items()]
+    buttons = [button(owner, ("✓ " if key == selected else "") + title, view, uid, key, extra,
+                      style="primary" if key == selected else None) for key, title in PERIODS.items()]
     return [buttons[:2], buttons[2:]]
 
 
@@ -165,21 +179,18 @@ def progress_bar(value: int, target: int) -> str:
 
 
 def stats_card(name: str, s: dict) -> str:
-    lines = [
-        card_title("Статистика активности", name),
-        f"<i>{escape(s['period_label'])}</i>", "",
-        summary(s["total"], s["active_days"]),
-    ]
-    values = [("Лупы", "loops"), ("Архивы", "zips"), ("Файлы", "files"), ("Медиа", "media"), ("Сообщения", "messages")]
-    nonzero = [f"{label} — <b>{number(s[key])}</b>" for label, key in values if s[key]]
-    if nonzero:
-        lines += [""] + nonzero
+    lines = [card_title("Статистика активности", name), escape(s['period_label']), ""]
+    if s["total"]:
+        lines += [metric_panel(summary(s["total"], s["active_days"]))]
+        values = [("🎵 Лупы", "loops"), ("📦 Архивы", "zips"), ("📎 Файлы", "files"),
+                  ("🖼 Медиа", "media"), ("💬 Сообщения", "messages")]
+        lines += [f"{label} · <b>{number(s[key])}</b>" for label, key in values if s[key]]
     else:
-        lines += ["", "Пока нет активности за этот период.", "Сообщения в подключённой группе появятся здесь автоматически."]
+        lines += ["Пока нет активности за этот период.", "Новые сообщения в группе появятся здесь автоматически."]
     if s["opportunities"]:
-        lines += [f"С тегом возможности — <b>{number(s['opportunities'])}</b>"]
+        lines += [f"🎯 Возможности · <b>{number(s['opportunities'])}</b>"]
     if s["streak"]:
-        lines += ["", f"<b>{number(s['streak'])}</b> {plural(s['streak'], 'день', 'дня', 'дней')} подряд"]
+        lines += [f"🔥 Серия · <b>{number(s['streak'])}</b> {plural(s['streak'], 'день', 'дня', 'дней')} подряд"]
     return "\n".join(lines)
 
 
@@ -194,15 +205,15 @@ def roles_card(name: str, p: dict) -> str:
         + f"\nBig — <b>{p['large_since']} / {p['large_target']}</b>\n{progress_bar(p['large_raw'], p['large_target'])}\n"
         + (f"<i>{p['large_raw']} в текущем цикле</i>\n" if p['large_raw'] > p['large_target'] else "")
         + "\n"
-        + f"<b>{status}</b>\n"
+        + f"{'✅' if p['ready'] else '◷'} <b>{status}</b>\n"
         + ("" if p["ready"] else f"До порога: {need_s} Small или {need_b} Big.\n")
-        + "\n<i>Для порога достаточно одной из шкал. Роль в группе выдаёт администратор.</i>"
+        + "\nДостаточно одной шкалы. Роль выдаёт администратор."
     )
 
 
 def help_card(admin: bool) -> str:
     text = (
-        "<b>Помощь</b>\n<i>Всё основное — в кнопках</i>\n\n"
+        "💡 <b>Помощь</b>\n\n"
         "<b>Активность</b>\nСообщения и вложения за выбранный период.\n\n"
         "<b>Профиль</b>\nПлейсменты и прогресс к следующей роли.\n\n"
         "Бот учитывает новые сообщения в подключённой группе. "
@@ -254,36 +265,33 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             start, end, _ = app.period_bounds("month")
             people = await app.user_pivot(session, start, end)
             total = sum(item['total'] for item in people.values())
-            text += (f"\n\n<b>Активность группы</b>\n{number(total)} {plural(total, 'действие', 'действия', 'действий')}"
-                     f" · {number(len(people))} {plural(len(people), 'участник', 'участника', 'участников')}")
+            totals = (f"{number(total)} {plural(total, 'действие', 'действия', 'действий')}"
+                      f" · {number(len(people))} {plural(len(people), 'участник', 'участника', 'участников')}")
+            text += "\n\n" + metric_panel(f"<b>Активность группы</b>\n{totals}")
             if not total:
                 text += "\n\nНовые сообщения в группе появятся здесь автоматически."
-            rows = [[button(owner, "Участники", "members"), button(owner, "Рейтинг", "top", extra="total")],
-                    [button(owner, "Моя активность", "stats", owner), button(owner, "Мой профиль", "profile", owner)],
-                    [button(owner, "Управление", "admin"), button(owner, "Помощь", "help")]]
+            rows = [[button(owner, "👥 Участники", "members", style="primary"), button(owner, "🏆 Рейтинг", "top", extra="total")],
+                    [button(owner, "📊 Моя активность", "stats", owner), button(owner, "👤 Мой профиль", "profile", owner)],
+                    [button(owner, "⚙️ Управление", "admin"), button(owner, "💡 Помощь", "help")]]
         else:
             s = await app.get_user_stats(session, owner, "month")
-            text += f"\n\n{escape(short(name, 36))}\n\n{summary(s['total'], s['active_days'])}"
+            text += f"\n{escape(short(name, 36))}\n\n" + metric_panel(summary(s['total'], s['active_days']))
             if not s['total']:
                 text += "\n\nОтправь сообщение или луп в группу — здесь появится твоя активность."
-            rows = [[button(owner, "Моя активность", "stats", owner), button(owner, "Мой профиль", "profile", owner)],
-                    [button(owner, "Помощь", "help")]]
+            rows = [[button(owner, "📊 Моя активность", "stats", owner, style="primary"), button(owner, "👤 Мой профиль", "profile", owner)],
+                    [button(owner, "💡 Помощь", "help")]]
     elif view == "stats":
         s = await app.get_user_stats(session, uid, period)
         text = stats_card(name, s)
         comparison = await activity_comparison(app, session, uid, period)
-        if comparison and (comparison["current"] or comparison["previous"]):
+        if comparison and comparison["previous"] and comparison["delta"]:
             current, previous = comparison["current"], comparison["previous"]
             delta = current - previous
-            if previous:
-                percent = comparison["percent"]
-                percent_text = f"{percent:+.0f}%" if abs(percent) >= 1 else f"{percent:+.1f}%".replace(".", ",")
-                change = f"{'+' if delta > 0 else ''}{number(delta)} · {percent_text}"
-            else:
-                change = "Раньше активности не было"
-            comparison_label = {"7d": "С предыдущими 7 днями", "30d": "С предыдущими 30 днями",
-                                "month": "За тот же отрезок прошлого месяца"}[period]
-            text += f"\n\n<b>Динамика</b>\n{change}\n<i>{comparison_label}</i>"
+            percent = comparison["percent"]
+            percent_text = f"{percent:+.0f}%" if abs(percent) >= 1 else f"{percent:+.1f}%".replace(".", ",")
+            comparison_label = {"7d": "к предыдущим 7 дням", "30d": "к предыдущим 30 дням",
+                                "month": "к тому же периоду прошлого месяца"}[period]
+            text += f"\n\n{'↗' if delta > 0 else '↘'} <b>{percent_text}</b> {comparison_label}"
         rows = period_buttons(owner, view, uid, period)
     elif view == "profile":
         month = await app.get_user_stats(session, uid, "month")
@@ -294,20 +302,20 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         has_messages = bool(await session.scalar(select(app.MsgLog.id).where(activity_where).limit(1)))
         text = card_title("Профиль", name) + "\n\n<b>Плейсменты и прогресс</b>\n"
         if p['total']:
-            text += (f"{number(p['total'])} за всё время · Small {number(p['small'])} · Big {number(p['large'])}\n\n"
-                     f"{'<b>Порог для роли достигнут</b>' if p['ready'] else 'До следующей роли'}\n"
+            text += (f"<b>{number(p['total'])}</b> за всё время · Small {number(p['small'])} · Big {number(p['large'])}\n\n"
+                     f"{'✅ <b>Порог для роли достигнут</b>' if p['ready'] else '🎖 До следующей роли'}\n"
                      f"Small <b>{p['small_since']} / {p['small_target']}</b>\n"
                      f"Big <b>{p['large_since']} / {p['large_target']}</b>")
         else:
             text += "Пока нет плейсментов."
         text += f"\n\n<b>Активность за месяц</b>\n{summary(month['total'], month['active_days'])}"
-        role_actions = [button(owner, "Прогресс роли", "roles", uid)]
+        role_actions = [button(owner, "🎖 Прогресс роли", "roles", uid)]
         if p["total"]:
-            role_actions.insert(0, button(owner, "Плейсменты", "places", uid))
-        activity_actions = [button(owner, "Активность", "stats", uid)]
+            role_actions.insert(0, button(owner, "🎯 Плейсменты", "places", uid))
+        activity_actions = [button(owner, "📊 Активность", "stats", uid)]
         has_archive = bool(await session.scalar(select(app.MonthlySnapshot.id).where(app.MonthlySnapshot.user_id == uid).limit(1)))
         if has_messages or has_archive:
-            activity_actions.append(button(owner, "По месяцам", "history", uid))
+            activity_actions.append(button(owner, "🗓 По месяцам", "history", uid))
         rows = [role_actions, activity_actions]
         if admin:
             rows += [[button(owner, "＋ Плейсмент", "addplace", uid), button(owner, "Ещё", "more", uid)]]
@@ -420,10 +428,14 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         old, new = json.loads(item.before_json), json.loads(item.after_json) if item.after_json else None
         def body(values):
             return values.get("text") or values.get("comment") or f"{values.get('artist') or '—'} | {values.get('track') or '—'}"
+        def excerpt(values):
+            content = body(values)
+            shown = escape(short(content, 600))
+            return f"<blockquote expandable>{shown}</blockquote>" if text_units(content) > 200 else shown
         text = card_title(f"Изменение #{item.id}", name) + f"\n<i>{app.format_local(item.created_at)}</i>\n\n"
-        text += f"<b>До</b>\n{escape(short(body(old), 600))}"
+        text += f"<b>До</b>\n{excerpt(old)}"
         if new:
-            text += f"\n\n<b>После</b>\n{escape(short(body(new), 600))}"
+            text += f"\n\n<b>После</b>\n{excerpt(new)}"
         if item.action == "delete":
             restored = (await session.scalars(select(app.RecordChange.after_json)
                         .where(app.RecordChange.user_id == uid, app.RecordChange.action == "restore"))).all()
@@ -440,7 +452,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         sort, raw_page = (parts[0], parts[1]) if len(parts) > 1 else ("recent", extra)
         directory_nonce = parts[2] if len(parts) > 2 else ("0" if not query else secrets.token_hex(3))
         directory = await member_directory(app, session, page=int(raw_page), query=query, sort=sort)
-        text = "<b>Участники</b>\n" + page_label(directory["total"], directory["page"], directory["pages"], "в базе") + "\n"
+        text = card_title("Участники") + "\n" + page_label(directory["total"], directory["page"], directory["pages"], "в базе") + "\n"
         text += f"\nПоиск: <b>{escape(short(query, 80))}</b>" if query else (
             "\nСначала — недавно активные в группе." if sort == "recent" else "\nУчастники по имени.")
         if not directory["items"]:
@@ -450,7 +462,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             rows += [[button(owner, "Сбросить поиск", "members")]]
         for member in directory["items"]:
             rows += [[button(owner, short(member["name"], 45), "profile", member["uid"])]]
-        switches = [[button(owner, ("✓ " if sort == key else "") + label, "members", extra=f"{key}.0.{directory_nonce}")
+        switches = [[button(owner, ("✓ " if sort == key else "") + label, "members", extra=f"{key}.0.{directory_nonce}", style="primary" if sort == key else None)
                      for key, label in (("recent", "Недавние"), ("name", "По имени"))]]
         rows += switches
         page, pages = directory["page"], directory["pages"]
@@ -480,21 +492,22 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             raise ValueError("Unknown metric")
         text = "<b>Категория рейтинга</b>\n\nВыбери, что сравнить."
         for keys in [("total", "contribution"), ("loops", "zips"), ("messages", "files"), ("media", "days"), ("opportunities",)]:
-            rows += [[button(owner, ("✓ " if key == extra else "") + METRICS[key], "top", period=period, extra=key) for key in keys]]
+            rows += [[button(owner, ("✓ " if key == extra else "") + METRICS[key], "top", period=period, extra=key,
+                             style="primary" if key == extra else None) for key in keys]]
     elif view == "admin":
-        text = "<b>Управление</b>\n<i>Роли, отчёты и данные группы</i>"
-        rows = [[button(owner, "Готовы к роли", "board", extra="ready.0"), button(owner, "Отчёты", "reports")],
-                [button(owner, "Экспорт CSV", "export"), button(owner, "Сервис", "service")]]
+        text = card_title("Управление") + "\nРоли, отчёты и данные группы."
+        rows = [[button(owner, "🎖 Готовы к роли", "board", extra="ready.0"), button(owner, "📋 Отчёты", "reports")],
+                [button(owner, "📤 Экспорт CSV", "export"), button(owner, "🛠 Сервис", "service")]]
         undo_target = await last_undo_target(app, session, owner)
         if undo_target and (isinstance(undo_target, app.Note) or await app.placement_can_be_undone(session, undo_target)):
             rows.insert(-1, [button(owner, "Отменить последнюю запись", "undo")])
     elif view == "service":
-        text = "<b>Сервис</b>\n<i>Состояние и резервные копии</i>"
+        text = card_title("Сервис") + "\nСостояние и резервные копии."
         rows = [[button(owner, "Состояние", "health"), button(owner, "Копия базы", "backup")],
                 [button(owner, "Пересчитать прошлый месяц", "snapshot")]]
     elif view == "reports":
         destination = await session.get(app.Setting, "report_chat")
-        text = "<b>Отчёты</b>\n<i>Прошлая календарная неделя</i>\n\nПонедельник — воскресенье."
+        text = card_title("Отчёты") + "\nПрошлая неделя · понедельник — воскресенье."
         if destination:
             text += f"\n\n<b>Автоотчёт включён</b>\nПонедельник · 12:00\n<i>{escape(app.BOT_TIMEZONE)}</i>"
         else:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from html import escape
 import os
 from pathlib import Path
@@ -27,13 +27,14 @@ CSS = """*{box-sizing:border-box}body{margin:0;padding:40px;background:#f5f5f7;c
 h1{font-size:30px;letter-spacing:-1px;margin:0 0 8px}header p{color:#6e6e73;max-width:800px;line-height:1.5}main{display:flex;flex-wrap:wrap;align-items:flex-start;gap:28px;margin-top:28px}
 .sample{width:320px;flex-shrink:0}.sample>h2{font-size:13px;color:#6e6e73;font-weight:500;margin:0 0 10px}.phone{background:#e9edf2;border:1px solid #d5d8dc;border-radius:22px;padding:14px 10px;box-shadow:0 5px 20px #00000007}
 .chat{padding:0 4px 12px;display:flex;gap:8px;align-items:center;font-size:14px;font-weight:600}.avatar{background:#202125;color:white;display:grid;place-items:center;width:32px;height:32px;border-radius:50%;font-size:11px}.chat small{display:block;color:#7b8289;font-weight:400;font-size:11px}
-.message{background:white;border-radius:15px 15px 15px 4px;padding:14px;font-size:15px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}.message b{font-weight:600}.message i{font-style:normal;color:#7a7d83}.message code{font-size:13px}
-.keys{display:grid;gap:5px;margin-top:6px}.row{display:flex;gap:5px}.row button{font-family:inherit;flex:1;min-width:0;border:0;border-radius:9px;color:#2577be;background:#ffffffbd;min-height:44px;font-size:13px;padding:9px 5px;line-height:18px;cursor:default}.label{display:block;white-space:nowrap}.dark{background:#1b252f;border-color:#25323e}.dark .chat{color:#f1f4f6}.dark .message{background:#263340;color:#f1f4f6}.dark .message i{color:#a3b0bc}.dark .row button{background:#2e4153;color:#9acdf7}
+.message{background:white;border-radius:15px 15px 15px 4px;padding:12px;font-size:15px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}.message b{font-weight:600}.message i{font-style:italic;color:inherit}.message code{font-size:13px}
+.keys{display:grid;gap:5px;margin-top:6px}.row{display:flex;gap:5px}.row button{font-family:inherit;flex:1;min-width:0;border:0;border-radius:9px;color:#2577be;background:#ffffffbd;min-height:44px;font-weight:600;font-size:13px;padding:9px 5px;line-height:18px;cursor:default}.label{display:block;white-space:nowrap}.dark{background:#17212b;border-color:#25323e}.dark .chat{color:#f1f4f6}.dark .message{background:#182633;color:#f1f4f6}.dark .row button{background:#202f3e;color:#f1f4f6}
+.message blockquote{display:inline-block;vertical-align:top;width:100%;margin:0;padding:6px 9px;border-left:3px solid #4c96cc;border-radius:5px;background:#4c96cc15;white-space:pre-wrap}.message blockquote[expandable]{max-height:100px;overflow:hidden}.row button[data-style=primary]{background:#337cba;color:white}.row button[data-style=success]{background:#3e9162;color:white}.row button[data-style=danger]{background:#b94e54;color:white}
 """
 
 
 def render(label: str, screen: Screen, dark: bool = False) -> str:
-    rows = "".join('<div class="row">' + "".join('<button><span class="label">' + escape(b.text) + '</span></button>' for b in row) + '</div>' for row in screen.markup.inline_keyboard)
+    rows = "".join('<div class="row">' + "".join(f'<button data-style="{b.style or "default"}"><span class="label">' + escape(b.text) + '</span></button>' for b in row) + '</div>' for row in screen.markup.inline_keyboard)
     return (f'<section class="sample"><h2>{escape(label)}</h2><div class="phone {"dark" if dark else ""}">'
             '<div class="chat"><div class="avatar">301</div><div>301secrets tracker<small>бот</small></div></div>'
             f'<div class="message">{screen.text}</div><div class="keys">{rows}</div></div></section>')
@@ -58,7 +59,15 @@ async def generate(target: Path) -> None:
                 artist="Artist", track="Late Night", actor_id=900,
                 created_at=app.utc_now() - timedelta(days=index), comment="Artist | Late Night"))
         session.add(app.Note(user_id=10, actor_id=900, text="Связаться по поводу следующего релиза.", created_at=app.utc_now()))
+        await app.upsert_user(session, 12, "raybanglassesonmyface", "Artist")
+        for stamp in (datetime(2026, 10, 31, 12), datetime(2026, 11, 1, 1)):
+            session.add(app.MsgLog(user_id=12, chat_id=-100123, category="media", created_at=stamp))
         await session.commit()
+        screenshot_time = datetime(2026, 11, 1, 1, 14)
+        with patch.object(app, "utc_now", return_value=screenshot_time), patch.object(app, "local_now", return_value=app.local_from_utc_naive(screenshot_time)):
+            screenshot = await build_screen(app, session, 900, "stats", 12)
+            cards.append(render("Сценарий со скриншота / тёмная · 320px", screenshot, True))
+            cards.append(render("Сценарий со скриншота / светлая · 320px", screenshot))
         views = [("home", "0"), ("profile", "0"), ("stats", "0"), ("roles", "0"), ("places", "0"),
                  ("more", "0"), ("members", "0"), ("top", "contribution"), ("admin", "0"),
                  ("reports", "0"), ("help", "0"), ("rules", "0")]
