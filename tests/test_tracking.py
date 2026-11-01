@@ -329,7 +329,9 @@ class TrackingTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as session:
             for incoming in (voice, audio, video_note):
                 await bot.track_message(session, incoming)
-            stats = await bot.get_user_stats(session, 10, "month")
+            # Periods are half-open; view the card after these messages arrived.
+            with patch.object(bot, "utc_now", return_value=NOW + timedelta(seconds=1)):
+                stats = await bot.get_user_stats(session, 10, "month")
             self.assertEqual((stats["messages"], stats["loops"], stats["media"], stats["total"]),
                              (1, 1, 1, 3))
 

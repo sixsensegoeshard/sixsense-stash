@@ -183,7 +183,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_note_can_be_cancelled_without_write(self):
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         preview = await self.command("private test note")
         await self.command("/cancel")
         await self.click(preview, "Сохранить")
@@ -192,11 +192,11 @@ class UITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirm_rejects_button_from_old_form(self):
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         old = await self.command("old note")
         await self.command("/cancel")
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         new = await self.command("new note")
         await self.click(old, "Сохранить")
         await self.click(new, "Сохранить")
@@ -206,11 +206,11 @@ class UITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_from_old_form_does_not_cancel_new_form(self):
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         old = await self.command("old note")
         await self.command("/cancel")
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         new = await self.command("new note")
         await self.click(old, "Отмена")
         await self.click(new, "Сохранить")
@@ -219,7 +219,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_navigation_command_cancels_pending_form(self):
         profile = await self.command("/profile @artist")
-        await self.click(profile, "＋ Заметка")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         await self.command("/roles")
         result = await self.command("Should not be a note")
         self.assertIn("301 / TRACKER", result.text)
@@ -399,7 +399,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             change = await session.scalar(select(app.RecordChange).where(app.RecordChange.action == "delete"))
             change_id = change.id
         profile = await self.command("/profile @artist")
-        changes = await self.click(profile, "История изменений")
+        changes = await self.click(await self.click(profile, "Ещё"), "История изменений")
         change = await self.click(changes, f"Изменение #{change_id}")
         restoring = await self.click(change, "Восстановить")
         await self.click(restoring, "Подтвердить")
@@ -471,7 +471,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("Удалить" in b.text for row in detail.reply_markup.inline_keyboard for b in row))
 
     async def test_unknown_command_does_not_erase_pending_draft(self):
-        await self.click(await self.command("/profile @artist"), "＋ Заметка")
+        profile = await self.command("/profile @artist")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         await self.command("/unknown_command")
         draft = await self.command("still the same note")
         await self.click(draft, "Сохранить")
@@ -585,7 +586,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("страница 2/2", second.text)
 
     async def test_expired_current_confirmation_clears_form_without_writes(self):
-        await self.click(await self.command("/profile @artist"), "＋ Заметка")
+        profile = await self.command("/profile @artist")
+        await self.click(await self.click(profile, "Ещё"), "＋ Заметка")
         draft = await self.command("expired")
         with patch.object(app, "utc_now", return_value=app.utc_now() + timedelta(minutes=16)):
             await self.click(draft, "Сохранить")
@@ -644,6 +646,57 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("личные сообщения", result.text)
         self.assertTrue(result.reply_markup.inline_keyboard[0][0].url.startswith("https://t.me/"))
         self.assertTrue(any(isinstance(call, SendMessage) and call.chat_id == 900 and "301 / TRACKER" in call.text for call in self.api.calls))
+
+    async def test_admin_home_counts_current_group_instead_of_admin_personal_stats(self):
+        with patch.object(app, "utc_now", return_value=NOW), patch.object(app, "local_now", return_value=app.local_from_utc_naive(NOW)):
+            async with self.sessions() as session:
+                for uid, chat, when in ((10, app.TRACK_CHAT_ID, NOW - timedelta(hours=1)),
+                                         (11, app.TRACK_CHAT_ID, NOW - timedelta(hours=2)),
+                                         (10, -999, NOW - timedelta(hours=1)),
+                                         (10, app.TRACK_CHAT_ID, NOW + timedelta(hours=1)),
+                                         (10, app.TRACK_CHAT_ID, NOW - timedelta(days=40))):
+                    session.add(app.MsgLog(user_id=uid, chat_id=chat, category="message", created_at=when))
+                await session.commit()
+                screen = await build_screen(app, session, 900)
+                self.assertIn("Активность группы", screen.text)
+                self.assertIn("2 действия · 2 участника", screen.text)
+
+    async def test_more_contains_secondary_actions_and_is_admin_only(self):
+        profile = await self.command("/profile @artist")
+        labels = [b.text for row in profile.reply_markup.inline_keyboard for b in row]
+        self.assertNotIn("＋ Заметка", labels)
+        self.assertLessEqual(len(labels), 8)
+        more = await self.click(profile, "Ещё")
+        await self.click(more, "＋ Заметка")
+        draft = await self.command("Useful note")
+        await self.click(draft, "Сохранить")
+        async with self.sessions() as session:
+            self.assertEqual((await session.scalar(select(app.Note))).text, "Useful note")
+            with self.assertRaises(PermissionError):
+                await build_screen(app, session, 10, "more")
+
+    async def test_profile_back_preserves_filtered_directory_page_and_sort(self):
+        async with self.sessions() as session:
+            for uid in range(20, 32):
+                await app.upsert_user(session, uid, f"match_{uid}", f"Match {uid}")
+            await session.commit()
+        await self.click(await self.command("/members"), "Найти")
+        matches = await self.command("match")
+        by_name = await self.click(matches, "По имени")
+        second = await self.click(by_name, "Далее")
+        profile = await self.click(second, "@match_28")
+        choice = await self.click(profile, "＋ Плейсмент")
+        profile = await self.click(choice, "Отмена")
+        back = await self.click(profile, "‹ Участники")
+        self.assertIn("страница 2/2", back.text)
+        self.assertIn("Поиск: <b>match</b>", back.text)
+        self.assertTrue(any(b.text == "✓ По имени" for row in back.reply_markup.inline_keyboard for b in row))
+
+    async def test_regular_user_can_reach_activity_rules_from_help(self):
+        help_screen = await self.command("/help", actor=10)
+        rules = await self.click(help_screen, "Как считается", actor=10)
+        self.assertIn("Одно сообщение", rules.text)
+        self.assertNotIn("Управление", rules.text)
 
     def test_callback_lengths_and_validation(self):
         for period in ("7d", "30d", "month", "all"):

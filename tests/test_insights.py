@@ -241,7 +241,7 @@ class InsightsTests(unittest.IsolatedAsyncioTestCase):
                 history = await monthly_history(app, session, 10)
                 self.assertEqual([(row["period"], row["total"]) for row in history], [("2026-10", 1), ("2026-09", 1)])
 
-    async def test_raw_month_overrides_archive_and_archive_survives_retention(self):
+    async def test_complete_archive_survives_partial_retention(self):
         async with self.sessions() as session:
             self.log(session, stamp=datetime(2026, 9, 15), category="files")
             self.archive(session, "2026-09", messages=99, total=99, active_days=30)
@@ -251,8 +251,17 @@ class InsightsTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
             history = await monthly_history(app, session, 10)
             self.assertEqual([row["period"] for row in history], ["2026-10", "2026-09", "2026-08", "2025-12"])
-            self.assertEqual((history[1]["total"], history[1]["files"], history[1]["messages"]), (1, 1, 0))
+            self.assertEqual((history[1]["total"], history[1]["files"], history[1]["messages"]), (99, 0, 99))
             self.assertEqual((history[2]["total"], history[2]["active_days"], history[2]["opportunities"]), (6, 3, 1))
+
+    async def test_complete_raw_month_can_extend_archive_without_double_counting(self):
+        async with self.sessions() as session:
+            self.log(session, stamp=datetime(2026, 9, 10), category="files")
+            self.log(session, stamp=datetime(2026, 9, 11), category="files")
+            self.archive(session, "2026-09", files=1, total=1, active_days=1)
+            await session.commit()
+            month = (await monthly_history(app, session, 10))[1]
+            self.assertEqual((month["total"], month["files"], month["active_days"]), (2, 2, 2))
 
     async def test_foreign_raw_logs_do_not_override_the_users_archive(self):
         async with self.sessions() as session:

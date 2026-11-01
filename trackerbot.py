@@ -438,7 +438,7 @@ def period_bounds(period: str) -> tuple[datetime | None, datetime, str]:
     if period == "all":
         return None, now, "всё время"
     start, end = current_month_range()
-    return start, end, current_month_label()
+    return start, min(end, now), current_month_label()
 
 
 def previous_calendar_week_range() -> tuple[datetime, datetime, str]:
@@ -1162,7 +1162,8 @@ async def placement_progress(session: AsyncSession, uid: int) -> dict:
 
 
 async def reset_placement_progress(
-    session: AsyncSession, uid: int, kind: str, actor_id: int | None, name: str | None
+    session: AsyncSession, uid: int, kind: str, actor_id: int | None, name: str | None,
+    *, expected_cycle: str | None = None,
 ) -> dict:
     async with user_write_lock(uid):
         # End earlier read snapshots; a second admin must see the first reset.
@@ -1173,6 +1174,11 @@ async def reset_placement_progress(
         p = await placement_progress(session, uid)
         if kind not in {"small", "big"}:
             raise ValueError("Укажи Small или Big.")
+        if expected_cycle is not None:
+            reset_at = p["small_reset_at" if kind == "small" else "large_reset_at"]
+            actual_cycle = reset_at.isoformat() if reset_at else "initial"
+            if actual_cycle != expected_cycle:
+                raise ValueError("Этот цикл роли уже подтверждён. Открой прогресс заново.")
         if not p["ready_small" if kind == "small" else "ready_big"]:
             raise ValueError("Порог этой роли ещё не достигнут или роль уже подтверждена.")
         return await _reset_placement_progress(session, uid, kind, actor_id, name)
@@ -1249,7 +1255,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"🏆 <b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности."
+        return f"<b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности."
 
     def metric(uid, user, active_days):
         if sort == "days":
@@ -1266,7 +1272,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
 
     users = {uid: user for uid, user in users.items() if metric(uid, user, days) > 0}
     if not users:
-        return f"🏆 <b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности в этой категории."
+        return f"<b>Рейтинг</b>\n<i>{escape_html(label)}</i>\n\nПока нет активности в этой категории."
     current = sorted(users.items(), key=sort_key, reverse=True)[:10]
     arrows: dict[int, str] = {}
     if period in {"7d", "30d"}:
@@ -1290,26 +1296,23 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
         }
         for idx, (uid, _) in enumerate(current, start=1):
             prev = prev_rank.get(uid)
-            arrows[uid] = "🆕" if prev is None else "↑" if prev > idx else "↓" if prev < idx else "•"
+            arrows[uid] = "новый" if prev is None else f"↑{prev - idx}" if prev > idx else f"↓{idx - prev}" if prev < idx else ""
 
     labels = {
         "total": "Вся активность", "messages": "Сообщения",
         "loops": "Лупы", "zips": "Архивы", "files": "Файлы",
         "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности", "contribution": "По вкладу",
     }
-    medals = ["🥇", "🥈", "🥉"]
-    out = f"{header('🏆', f'Рейтинг · {labels.get(sort, sort)}')}\n<i>{escape_html(label)}</i>\n\n"
+    out = f"<b>Рейтинг</b>\n<i>{escape_html(labels.get(sort, sort))} · {escape_html(label)}</i>\n\n"
     for idx, (uid, user) in enumerate(current, start=1):
-        marker = medals[idx - 1] if idx <= 3 else f"{idx}."
+        marker = f"{idx}."
         name = escape_html(short(display_name(user["un"], user["fn"]), 36))
         value = metric(uid, user, days)
         shown = number(int(value)) if value == int(value) else f"{value:g}".replace(".", ",")
         unit = " баллов" if sort == "contribution" else " дн." if sort == "days" else ""
-        out += f"{marker} <b>{name}</b>\n{shown}{unit} {arrows.get(uid, '')}\n\n"
-    if sort == "contribution":
-        out += "\n<i>Баллы: луп 3 · архив 2 · файл 1,5 · возможность 2 · медиа 1 · сообщение 0,25 · активный день 1. "
-        out += "Это объём вклада, а не оценка качества музыки.</i>"
-    return out
+        change = f" · {arrows[uid]}" if arrows.get(uid) else ""
+        out += f"{marker} <b>{name}</b>\n{shown}{unit}{change}\n\n"
+    return out.rstrip()
 
 
 def activity_score(user: dict, active_days: int) -> float:
@@ -1377,28 +1380,51 @@ async def build_weekly_report(session: AsyncSession) -> str | None:
 
 
 async def make_snapshot(session: AsyncSession) -> str:
-    start, end, period = previous_calendar_month_range()
-    await session.execute(delete(MonthlySnapshot).where(MonthlySnapshot.period == period))
-    users = await user_pivot(session, start, end)
-    days = await user_days(session, start, end)
-    for uid, user in users.items():
-        session.add(
-            MonthlySnapshot(
-                user_id=uid,
-                username=user["un"],
-                period=period,
-                messages=user["messages"],
-                loops=user["loops"],
-                zips=user["zips"],
-                files=user["files"],
-                media=user["media"],
-                opportunities=user["opportunities"],
-                active_days=days.get(uid, 0),
-                total=user["total"],
-            )
-        )
-    await session.merge(Setting(key="snapshot_last_period", value=period))
-    await session.commit()
+    # Separate from save_entry's -1 lock: manual and scheduled snapshots must
+    # serialize with retention without acquiring that outer lock recursively.
+    async with user_write_lock(-2):
+        await session.commit()
+        try:
+            start, end, period = previous_calendar_month_range()
+            pruned_before = await session.scalar(select(Setting.value).where(
+                Setting.key == "retention_deleted_before"
+            ))
+            if pruned_before and datetime.fromisoformat(pruned_before) > start:
+                raise ValueError(
+                    "Исходные сообщения этого месяца уже очищены. "
+                    "Пересчёт недоступен; сохранённый архив не изменён."
+                )
+            users = await user_pivot(session, start, end)
+            days = await user_days(session, start, end)
+            archived = (await session.scalars(select(MonthlySnapshot).where(
+                MonthlySnapshot.period == period
+            ).execution_options(populate_existing=True))).all()
+            # Also protect archives pruned by older versions, before the
+            # retention watermark existed. Message logs only accumulate.
+            fields = ("messages", "loops", "zips", "files", "media", "opportunities", "total")
+            for row in archived:
+                candidate = users.get(row.user_id, {})
+                if any((getattr(row, key) or 0) > candidate.get(key, 0) for key in fields) or (
+                    row.active_days or 0
+                ) > days.get(row.user_id, 0):
+                    raise ValueError(
+                        "Исходные сообщения месяца неполны. "
+                        "Пересчёт недоступен; сохранённый архив не изменён."
+                    )
+            await session.execute(delete(MonthlySnapshot).where(MonthlySnapshot.period == period))
+            for uid, user in users.items():
+                session.add(MonthlySnapshot(
+                    user_id=uid,
+                    username=user["un"],
+                    period=period,
+                    **{key: user[key] for key in fields},
+                    active_days=days.get(uid, 0),
+                ))
+            await session.merge(Setting(key="snapshot_last_period", value=period))
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
     return period
 
 
@@ -1839,10 +1865,34 @@ async def backup_database(session: AsyncSession | None = None) -> Path | None:
 async def retention_cleanup(session: AsyncSession) -> int:
     if MSG_RETENTION_DAYS <= 0:
         return 0
-    cutoff = utc_now() - timedelta(days=MSG_RETENTION_DAYS)
-    result = await session.execute(delete(MsgLog).where(MsgLog.created_at < cutoff))
-    await session.commit()
-    return result.rowcount or 0
+    async with user_write_lock(-2):
+        await session.commit()
+        try:
+            previous_start, current_start, previous_period = previous_calendar_month_range()
+            week_start, _, _ = previous_calendar_week_range()
+            # Keep the current month's source and the full week displayed by
+            # manual reports, including before Monday's scheduled noon send.
+            cutoff = min(utc_now() - timedelta(days=MSG_RETENTION_DAYS), current_start, week_start)
+            archived_period = await session.scalar(select(Setting.value).where(
+                Setting.key == "snapshot_last_period"
+            ))
+            if archived_period != previous_period:
+                cutoff = min(cutoff, previous_start)
+            pruned_before = await session.scalar(select(Setting.value).where(
+                Setting.key == "retention_deleted_before"
+            ))
+            watermark = max(cutoff, datetime.fromisoformat(pruned_before)) if pruned_before else cutoff
+            result = await session.execute(delete(MsgLog).where(MsgLog.created_at < cutoff))
+            removed = result.rowcount or 0
+            if removed:
+                await session.merge(Setting(
+                    key="retention_deleted_before", value=watermark.isoformat(timespec="microseconds")
+                ))
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+    return removed
 
 
 async def startup_catchup(bot: Bot) -> None:

@@ -174,7 +174,8 @@ def _empty_month(period):
 async def monthly_history(app, session, uid):
     """Return local monthly counts newest first, always including this month.
 
-    Any raw group logs for a user/month override that entire archived month.
+    Complete raw logs override archives; partial retained logs never shrink a
+    completed archived month. Counts from both sources are never added together.
     Snapshots have no chat ID in this schema and must be the tracked group's
     archives. Only completed, valid archive months are used. Unknown categories
     go to files, matching user_pivot; opportunities are an overlapping counter.
@@ -203,18 +204,22 @@ async def monthly_history(app, session, uid):
         days.setdefault(period, set()).add(local.date())
     for period, dates in days.items():
         months[period]["active_days"] = len(dates)
+    archived_periods = set()
     for snapshot in snapshots:
         period = snapshot.period or ""
-        if period in months or period >= current or not re.fullmatch(r"[0-9]{4}-[0-9]{2}", period):
+        if period in archived_periods or period >= current or not re.fullmatch(r"[0-9]{4}-[0-9]{2}", period):
             continue
         try:
             datetime.strptime(period, "%Y-%m")
         except ValueError:
             continue
-        months[period] = {
+        archived_periods.add(period)
+        archived = {
             "period": period,
             **{field: int(getattr(snapshot, field) or 0) for field in _MONTH_FIELDS},
         }
+        if period not in months or any(archived[field] > months[period][field] for field in _MONTH_FIELDS):
+            months[period] = archived
     return [months[period] for period in sorted(months, reverse=True)]
 
 
