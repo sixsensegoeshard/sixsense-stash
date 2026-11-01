@@ -43,10 +43,17 @@ def record_key(kind: str, record_id: int, version: str = "") -> str:
 
 
 def parse_record_key(value: str) -> tuple[str, int, str]:
-    parts = value.split(".")
+    parts = value.split("~", 1)[0].split(".")
     if len(parts) not in {2, 3} or parts[0] not in {"p", "n"} or not parts[1].isdigit():
         raise ValueError("Эта запись недоступна.")
     return ("place" if parts[0] == "p" else "note", int(parts[1]), parts[2] if len(parts) == 3 else "")
+
+
+def source_page(value: str) -> str:
+    page = value.split("~", 1)[1] if "~" in value else "0"
+    if not page.isdigit():
+        raise ValueError("Недоступная страница записи.")
+    return page
 
 
 def draft_buttons(owner: int, data: dict) -> InlineKeyboardMarkup:
@@ -138,6 +145,10 @@ def card_title(text: str, subtitle: str = "") -> str:
 
 def page_label(count: int, page: int, pages: int, noun: str = "записей") -> str:
     suffix = f" · страница {page + 1}/{pages}" if pages > 1 else ""
+    if noun == "записей":
+        noun = plural(count, "запись", "записи", "записей")
+    elif noun == "участников":
+        noun = plural(count, "участник", "участника", "участников")
     return f"<i>{number(count)} {noun}{suffix}</i>"
 
 
@@ -161,14 +172,44 @@ def button(owner: int, label: str, action: str, uid: int = 0, period: str = "mon
 
 
 def keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    compact_rows = []
     for row in rows:
+        # Static actions keep their full meaning. Long paired actions get their
+        # own row instead of being truncated in a narrow native Telegram bubble.
+        if len(row) > 1 and any(label_width(item.text) > 13 for item in row):
+            compact_rows.extend([[item] for item in row])
+        else:
+            compact_rows.append(row)
+    for row in compact_rows:
         for item in row:
-            item.text = short(item.text, 36 if len(row) == 1 else 22)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+            limit = min(text_units(item.text), 36 if len(row) == 1 else 22)
+            while label_width(short(item.text, limit)) > (24 if len(row) == 1 else 13) and limit > 1:
+                limit -= 1
+            item.text = short(item.text, limit)
+    return InlineKeyboardMarkup(inline_keyboard=compact_rows)
+
+
+def label_width(text: str) -> float:
+    """Conservative relative glyph widths, not just UTF-16 character counts."""
+    result = 0.0
+    for char in text:
+        if unicodedata.category(char).startswith("M") or char == "\u200d":
+            continue
+        if char.isspace() or char in ".,:;|!il'`":
+            result += 0.45
+        elif char in "WMmwЖШЩЮЫжшщюы":
+            result += 1.5
+        elif unicodedata.east_asian_width(char) in {"W", "F"}:
+            result += 2
+        elif char.isupper():
+            result += 1.15
+        else:
+            result += 1
+    return result
 
 
 def period_buttons(owner: int, view: str, uid: int, selected: str, extra: str = "0") -> list[list[InlineKeyboardButton]]:
-    buttons = [button(owner, ("✓ " if key == selected else "") + title, view, uid, key, extra,
+    buttons = [button(owner, title, view, uid, key, extra,
                       style="primary" if key == selected else None) for key, title in PERIODS.items()]
     return [buttons[:2], buttons[2:]]
 
@@ -271,14 +312,14 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             if not total:
                 text += "\n\nНовые сообщения в группе появятся здесь автоматически."
             rows = [[button(owner, "👥 Участники", "members", style="primary"), button(owner, "🏆 Рейтинг", "top", extra="total")],
-                    [button(owner, "📊 Моя активность", "stats", owner), button(owner, "👤 Мой профиль", "profile", owner)],
+                    [button(owner, "📊 Активность", "stats", owner), button(owner, "👤 Профиль", "profile", owner)],
                     [button(owner, "⚙️ Управление", "admin"), button(owner, "💡 Помощь", "help")]]
         else:
             s = await app.get_user_stats(session, owner, "month")
             text += f"\n{escape(short(name, 36))}\n\n" + metric_panel(summary(s['total'], s['active_days']))
             if not s['total']:
                 text += "\n\nОтправь сообщение или луп в группу — здесь появится твоя активность."
-            rows = [[button(owner, "📊 Моя активность", "stats", owner, style="primary"), button(owner, "👤 Мой профиль", "profile", owner)],
+            rows = [[button(owner, "📊 Активность", "stats", owner, style="primary"), button(owner, "👤 Профиль", "profile", owner)],
                     [button(owner, "💡 Помощь", "help")]]
     elif view == "stats":
         s = await app.get_user_stats(session, uid, period)
@@ -309,10 +350,10 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         else:
             text += "Пока нет плейсментов."
         text += f"\n\n<b>Активность за месяц</b>\n{summary(month['total'], month['active_days'])}"
-        role_actions = [button(owner, "🎖 Прогресс роли", "roles", uid)]
+        role_actions = [button(owner, "🎖 Роли", "roles", uid)]
         if p["total"]:
             role_actions.insert(0, button(owner, "🎯 Плейсменты", "places", uid))
-        activity_actions = [button(owner, "📊 Активность", "stats", uid)]
+        activity_actions = [button(owner, "📊 Активность", "stats", uid, period)]
         has_archive = bool(await session.scalar(select(app.MonthlySnapshot.id).where(app.MonthlySnapshot.user_id == uid).limit(1)))
         if has_messages or has_archive:
             activity_actions.append(button(owner, "🗓 По месяцам", "history", uid))
@@ -324,7 +365,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         rows = [[button(owner, "＋ Заметка", "addnote", uid)]]
         if await session.scalar(select(app.Note.id).where(app.Note.user_id == uid).limit(1)):
             rows += [[button(owner, "Заметки", "notes", uid)]]
-        activity_where = app.MsgLog.user_id == uid
+        activity_where = (app.MsgLog.user_id == uid) & (app.MsgLog.created_at < app.utc_now())
         if app.TRACK_CHAT_ID is not None:
             activity_where &= app.MsgLog.chat_id == app.TRACK_CHAT_ID
         if await session.scalar(select(app.MsgLog.id).where(activity_where).limit(1)):
@@ -366,6 +407,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         page = int(extra)
         model = {"places": app.Placement, "notes": app.Note, "last": app.MsgLog, "changes": app.RecordChange}[view]
         where = model.user_id == uid
+        if view == "last":
+            where &= model.created_at < app.utc_now()
         if view == "last" and app.TRACK_CHAT_ID is not None:
             where = where & (model.chat_id == app.TRACK_CHAT_ID)
         items, count, page, pages = await page_rows(session, model, where, [model.created_at.desc(), model.id.desc()], page)
@@ -380,13 +423,13 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                 kind = "place" if view == "places" else "note"
                 label = f"{idx}. {app.short_date(item.created_at)}" + (f" · {'Big' if item.tier == 'large' else 'Small'}" if kind == "place" else "")
                 text += f"\n<b>{label}</b>\n{escape(short(entry_body(item, kind), 96))}\n"
-                rows += [[button(owner, f"{idx}. Открыть", "rec", uid, extra=record_key(kind, item.id))]]
+                rows += [[button(owner, f"{idx}. Открыть", "rec", uid, extra=record_key(kind, item.id) + f"~{page}")]]
             elif view == "changes":
                 labels = {"edit": "Исправлено", "delete": "Удалено", "restore": "Восстановлено"}
                 actor_name = await app.resolve_name(session, item.actor_id) or f"ID {item.actor_id}"
                 text += f"\n<b>{labels.get(item.action, item.action)}</b> · {app.short_date(item.created_at)}\n"
                 text += f"{'Плейсмент' if item.record_kind == 'place' else 'Заметка'} · {escape(short(actor_name, 36))}\n"
-                rows += [[button(owner, f"Изменение #{item.id}", "change", uid, extra=str(item.id))]]
+                rows += [[button(owner, f"Изменение #{item.id}", "change", uid, extra=f"{item.id}~{page}")]]
             else:
                 category = CATEGORIES.get(item.category, "Файл")
                 text += f"\n<b>{category}</b> · {app.format_local(item.created_at)}\n{escape(short(item.text_preview, 96))}\n"
@@ -414,15 +457,15 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             text += escape(entry_body(item, kind))
             editable = kind == "note" or await app.placement_can_be_undone(session, item)
             if admin and editable:
-                key = record_key(kind, item.id, record_version(item))
-                rows += [[button(owner, "✎ Исправить текст", "edt", uid, extra=key),
+                key = record_key(kind, item.id, record_version(item)) + "~" + source_page(extra)
+                rows += [[button(owner, "✎ Текст", "edt", uid, extra=key),
                           button(owner, "Удалить", "del", uid, extra=key)]]
                 if kind == "place":
                     rows += [[button(owner, "Изменить Small / Big", "tier", uid, extra=key)]]
             elif admin:
                 text += "\n\n🔒 По этой записи уже подтверждена роль. Изменение недоступно."
     elif view == "change":
-        item = await session.get(app.RecordChange, int(extra))
+        item = await session.get(app.RecordChange, int(extra.split("~", 1)[0]))
         if not item or item.user_id != uid:
             raise ValueError("Изменение не найдено.")
         old, new = json.loads(item.before_json), json.loads(item.after_json) if item.after_json else None
@@ -444,7 +487,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                 text += "\n\n✅ Запись уже восстановлена."
             else:
                 text += "\n\nЗапись удалена. Восстановление вернёт исходные дату и содержание."
-                rows += [[button(owner, "Восстановить запись", "restore", uid, extra=str(item.id))]]
+                rows += [[button(owner, "Восстановить запись", "restore", uid, extra=f"{item.id}~{source_page(extra)}")]]
     elif view == "members":
         parts = extra.split(".")
         if len(parts) > 2 and parts[2] == "0":
@@ -478,7 +521,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             raise ValueError("Unknown metric")
         text = await app.build_top(session, extra, period)
         rows = period_buttons(owner, view, 0, period, extra)
-        rows += [[button(owner, "Категория · " + METRICS[extra], "metrics", period=period, extra=extra)]]
+        rows += [[button(owner, "⚙️ Категория", "metrics", period=period, extra=extra)]]
         if extra == "contribution":
             rows += [[button(owner, "Как считаются баллы", "scoring", period=period, extra=extra)]]
     elif view == "scoring":
@@ -491,20 +534,20 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         if extra not in METRICS:
             raise ValueError("Unknown metric")
         text = "<b>Категория рейтинга</b>\n\nВыбери, что сравнить."
-        for keys in [("total", "contribution"), ("loops", "zips"), ("messages", "files"), ("media", "days"), ("opportunities",)]:
+        for key in METRICS:
             rows += [[button(owner, ("✓ " if key == extra else "") + METRICS[key], "top", period=period, extra=key,
-                             style="primary" if key == extra else None) for key in keys]]
+                             style="primary" if key == extra else None)]]
     elif view == "admin":
         text = card_title("Управление") + "\nРоли, отчёты и данные группы."
-        rows = [[button(owner, "🎖 Готовы к роли", "board", extra="ready.0"), button(owner, "📋 Отчёты", "reports")],
-                [button(owner, "📤 Экспорт CSV", "export"), button(owner, "🛠 Сервис", "service")]]
+        rows = [[button(owner, "🎖 К роли", "board", extra="ready.0"), button(owner, "📋 Отчёты", "reports")],
+                [button(owner, "📤 CSV", "export"), button(owner, "🛠 Сервис", "service")]]
         undo_target = await last_undo_target(app, session, owner)
         if undo_target and (isinstance(undo_target, app.Note) or await app.placement_can_be_undone(session, undo_target)):
-            rows.insert(-1, [button(owner, "Отменить последнюю запись", "undo")])
+            rows.insert(-1, [button(owner, "↩ Отменить последнее", "undo")])
     elif view == "service":
         text = card_title("Сервис") + "\nСостояние и резервные копии."
         rows = [[button(owner, "Состояние", "health"), button(owner, "Копия базы", "backup")],
-                [button(owner, "Пересчитать прошлый месяц", "snapshot")]]
+                [button(owner, "Пересчитать архив", "snapshot")]]
     elif view == "reports":
         destination = await session.get(app.Setting, "report_chat")
         text = card_title("Отчёты") + "\nПрошлая неделя · понедельник — воскресенье."
@@ -555,7 +598,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                   for key, label in (("ready", "Готовы"), ("all", "Все"))]]
         for member_id, member_name, p in entries[page * 8:(page + 1) * 8]:
             text += f"\n<b>{escape(short(member_name, 32))}</b>\nSmall {p['small_since']} / {p['small_target']} · Big {p['large_since']} / {p['large_target']}\n"
-            rows += [[button(owner, short(member_name, 45), "roles", member_id)]]
+            rows += [[button(owner, short(member_name, 45), "roles", member_id, extra=f"b.{mode}.{page}")]]
         nav = []
         if page:
             nav += [button(owner, "‹ Назад", "board", extra=f"{mode}.{page - 1}")]
@@ -571,11 +614,11 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         raise ValueError("Unknown screen")
     parents = {
         **{key: ("‹ Профиль", "profile", uid, "0") for key in ("stats", "places", "notes", "last", "roles", "history", "changes")},
-        "rec": ("‹ Плейсменты" if kind == "place" else "‹ Заметки", "places" if kind == "place" else "notes", uid, "0") if view == "rec" else None,
-        "change": ("‹ История", "changes", uid, "0"),
+        "rec": ("‹ К списку", "places" if kind == "place" else "notes", uid, source_page(extra)) if view == "rec" else None,
+        "change": ("‹ История", "changes", uid, source_page(extra)) if view == "change" else None,
         "report": ("‹ Отчёты", "reports", 0, "0"),
         "reportsetup": ("‹ Отчёты", "reports", 0, "0"),
-        "board": ("‹ Управление", "admin", 0, "0"),
+        "board": ("‹ Назад", "admin", 0, "0"),
         "reports": ("‹ Управление", "admin", 0, "0"),
         "service": ("‹ Управление", "admin", 0, "0"),
         "health": ("‹ Сервис", "service", 0, "0"),
@@ -586,6 +629,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
     }
     for key in ("notes", "last", "changes"):
         parents[key] = ("‹ Ещё", "more", uid, "0")
+    if view == "roles" and extra.startswith("b."):
+        parents[view] = ("‹ Роли группы", "board", 0, extra[2:])
     if view == "profile" and admin and uid != owner:
         parents[view] = ("‹ Участники", "members", 0, directory_extra)
     if view != "home":
@@ -652,7 +697,8 @@ async def save_entry(app, session, actor: int, data: dict) -> str:
         await app.reset_placement_progress(session, uid, data["kind"], actor, name,
                                           expected_cycle=data.get("role_cycle"))
         return "Выдача роли подтверждена. Начат новый цикл."
-    async with app.user_write_lock(data["uid"] if data["kind"] != "snapshot" else -1):
+    lock_id = -3 if data["kind"] == "reportoff" else -1 if data["kind"] == "snapshot" else data["uid"]
+    async with app.user_write_lock(lock_id):
         await session.commit()
         return await _save_entry(app, session, actor, data)
 
@@ -661,6 +707,10 @@ async def _save_entry(app, session, actor: int, data: dict) -> str:
     if data["kind"] == "snapshot":
         return f"Архив за {await app.make_snapshot(session)} сохранён."
     if data["kind"] == "reportoff":
+        current = dict((await session.execute(select(app.Setting.key, app.Setting.value)
+                       .where(app.Setting.key.in_(("report_chat", "report_thread"))))).all())
+        if "report_destination" in data and current != data["report_destination"]:
+            raise ValueError("Настройка отчёта уже изменилась. Открой отчёты заново.")
         for key in ("report_chat", "report_thread"):
             row = await session.get(app.Setting, key)
             if row:
@@ -708,7 +758,7 @@ def confirmation_text(app, data: dict) -> str:
         return f"🎖 <b>Подтвердить выдачу роли?</b>\n\n{name} · {data['kind'].title()}\n\nПрогресс этой шкалы начнётся заново. История плейсментов сохранится."
     label = "Плейсмент · " + ("Big" if data.get("tier") == "large" else "Small") if data["kind"] == "place" else "Заметка"
     step = "Шаг 3 из 3 · Проверка" if data["kind"] == "place" else "Шаг 2 из 2 · Проверка"
-    return f"<b>{label}</b>\n<i>{name}</i>\n\n<i>{step}</i>\n\n{escape(data['text'])}\n\nСохранить запись?"
+    return f"<b>{label}</b>\n{name}\n{step}\n\n{escape(data['text'])}\n\nСохранить запись?"
 
 
 async def last_undo_target(app, session, actor: int):
@@ -766,14 +816,18 @@ def register_ui(parent: Router, app) -> None:
                 return
             await state.clear()
             await state.set_data(directory_context(data))
-            await edit_screen(query, await build_screen(app, session, owner, data.get("cancel_view", "profile"), data.get("uid", owner),
+            cancel_view = data.get("cancel_view", "profile")
+            cancel_extra = data.get("directory_extra", "0") if cancel_view == "members" else data.get("cancel_extra", data.get("result_extra", "0"))
+            await edit_screen(query, await build_screen(app, session, owner, cancel_view, data.get("uid", owner),
+                                                      data.get("result_period", period), cancel_extra,
+                                                      query=data.get("directory_query", ""),
                                                       directory_extra=data.get("directory_extra", "recent.0.0")))
             return
         if action in {"small", "large"}:
             data = await state.get_data()
             same_form = await state.get_state() == Entry.tier.state and data.get("nonce") == extra and data.get("uid") == uid
             if not same_form or app.utc_now().timestamp() - data.get("started", 0) > FORM_TTL:
-                if not same_form and await state.get_state():
+                if not same_form:
                     return
                 if same_form:
                     await state.clear()
@@ -783,7 +837,7 @@ def register_ui(parent: Router, app) -> None:
             data = await state.get_data()
             same_form = await state.get_state() == Entry.confirm.state and data.get("nonce") == extra and data.get("preview_id") == query.message.message_id
             if not same_form or app.utc_now().timestamp() - data.get("started", 0) > FORM_TTL:
-                if not same_form and await state.get_state():
+                if not same_form:
                     return
                 if same_form:
                     await state.clear()
@@ -807,10 +861,15 @@ def register_ui(parent: Router, app) -> None:
             await state.set_data(directory_context(data))
             screen = await build_screen(app, session, owner, data.get("result_view",
                                         "admin" if data["kind"] in {"undo", "snapshot"} else "profile"), data["uid"],
+                                        data.get("result_period", period), data.get("result_extra", "0"),
                                         directory_extra=data.get("directory_extra", "recent.0.0"))
             screen.text = f"{escape(result)}\n\n" + screen.text
-            if data["kind"] in {"place", "note"}:
-                screen.markup.inline_keyboard.insert(0, [button(owner, "↩️ Отменить последнее добавление", "undo")])
+            if data["kind"] in {"place", "note"} and result in {"Плейсмент сохранён.", "Заметка сохранена."}:
+                target = await last_undo_target(app, session, owner)
+                if target and target.user_id == data["uid"]:
+                    kind = "note" if isinstance(target, app.Note) else "place"
+                    key = "r." + record_key(kind, target.id, record_version(target))
+                    screen.markup.inline_keyboard.insert(0, [button(owner, "↩ Отменить запись", "undo", data["uid"], extra=key)])
             await edit_screen(query, screen)
             return
         previous = await state.get_data()
@@ -837,6 +896,7 @@ def register_ui(parent: Router, app) -> None:
                     "tier": item.tier if kind == "place" else None,
                     "result_view": "places" if kind == "place" else "notes",
                     "cancel_view": "places" if kind == "place" else "notes",
+                    "result_extra": source_page(extra), "cancel_extra": source_page(extra),
                     "nonce": nonce, "started": app.utc_now().timestamp(), "tier_only": action == "tier"}
             if action == "del":
                 await preview(query, state, data)
@@ -855,14 +915,17 @@ def register_ui(parent: Router, app) -> None:
             return
         if action in {"restore", "reportoff"}:
             if action == "restore":
-                change = await session.get(app.RecordChange, int(extra))
+                change = await session.get(app.RecordChange, int(extra.split("~", 1)[0]))
                 if not change or change.user_id != uid or change.action != "delete":
                     await edit_screen(query, await build_screen(app, session, owner, "changes", uid))
                     return
                 text = "🧾 <b>Восстановить удалённую запись?</b>\n\nВернутся исходные содержание, участник и дата."
-                data = {"kind": "restore", "change_id": change.id, "uid": uid, "text": text, "result_view": "changes"}
+                data = {"kind": "restore", "change_id": change.id, "uid": uid, "text": text, "result_view": "changes", "result_extra": source_page(extra)}
             else:
-                data = {"kind": "reportoff", "uid": owner, "text": "📋 <b>Выключить автоотчёт?</b>\n\nРучной просмотр останется доступным.", "result_view": "reports"}
+                destination = dict((await session.execute(select(app.Setting.key, app.Setting.value)
+                                   .where(app.Setting.key.in_(("report_chat", "report_thread"))))).all())
+                data = {"kind": "reportoff", "uid": owner, "text": "📋 <b>Выключить автоотчёт?</b>\n\nРучной просмотр останется доступным.",
+                        "result_view": "reports", "report_destination": destination}
             await preview(query, state, data)
             return
         if action == "search":
@@ -892,6 +955,7 @@ def register_ui(parent: Router, app) -> None:
                     return
                 reset_at = p["small_reset_at" if kind == "small" else "large_reset_at"]
                 await preview(query, state, {"kind": kind, "uid": uid, "name": name,
+                                            "result_view": "roles", "cancel_view": "roles", "result_extra": extra,
                                             "role_cycle": reset_at.isoformat() if reset_at else "initial"})
                 return
             if action in {"small", "large"} and previous.get("kind") == "edit":
@@ -920,11 +984,23 @@ def register_ui(parent: Router, app) -> None:
             text = "🗓 <b>Пересчитать архив прошлого месяца?</b>\n\nТекущие сообщения сохранятся."
             data = {"kind": action, "uid": owner, "name": "", "result_view": "service" if action == "snapshot" else "admin"}
             if action == "undo":
+                if extra == "profile" or extra.startswith("r."):
+                    data.update(result_view="profile", cancel_view="profile")
                 target = await last_undo_target(app, session, owner)
                 if not target:
-                    await edit_screen(query, Screen("Нет записей для отмены за последние 15 минут.", keyboard([[button(owner, "‹ Управление", "admin")]])))
+                    view = data.get("cancel_view", "admin")
+                    screen = await build_screen(app, session, owner, view, uid if view == "profile" else owner)
+                    screen.text = "Нет доступных записей для отмены.\n\n" + screen.text
+                    await edit_screen(query, screen)
                     return
                 kind = "note" if isinstance(target, app.Note) else "place"
+                if extra.startswith("r."):
+                    expected_kind, expected_id, expected_version = parse_record_key(extra[2:])
+                    if (kind, target.id, target.user_id, record_version(target)) != (expected_kind, expected_id, uid, expected_version):
+                        screen = await build_screen(app, session, owner, "profile", uid)
+                        screen.text = "Эта кнопка относится к прежней записи. Открой нужную запись из списка.\n\n" + screen.text
+                        await edit_screen(query, screen)
+                        return
                 data["uid"] = target.user_id
                 text = f"↩️ <b>Отменить последнюю запись?</b>\n\n{escape(short(target.username or target.user_id))}\n{escape(short(target.text if kind == 'note' else target.comment or target.artist or 'Плейсмент', 240))}"
                 data["target"] = f"{kind}-{target.id}"
@@ -1002,8 +1078,15 @@ def register_ui(parent: Router, app) -> None:
         await state.update_data({**data, "nonce": nonce, "preview_id": sent.message_id})
 
     @ui.message(Entry.confirm, F.chat.type == "private", ~F.text.startswith("/"))
-    async def waiting_confirmation(message: Message):
-        await message.answer("Проверь запись выше. Нажми «Сохранить», «Изменить текст» или «Отмена».")
+    async def waiting_confirmation(message: Message, state: FSMContext):
+        data = await state.get_data()
+        if data.get("kind") in {"place", "note", "edit"}:
+            hint = "Проверь запись выше. Нажми «Сохранить» или «Отмена»."
+            if not data.get("tier_only"):
+                hint += " Текст можно исправить кнопкой «Изменить текст»."
+        else:
+            hint = "Нажми «Подтвердить» или «Отмена» в сообщении выше."
+        await message.answer(hint)
 
     @ui.message(Entry.tier, F.chat.type == "private", ~F.text.startswith("/"))
     async def waiting_tier(message: Message):

@@ -52,7 +52,8 @@ from aiogram.types import (
     Message,
     TelegramObject,
 )
-from tracker_ui import build_screen, deliver, register_ui, short, number, plural
+from tracker_ui import METRICS, build_screen, deliver, register_ui, short, number, plural
+from tracker_runtime import AlreadyRunning, single_instance
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -1251,11 +1252,14 @@ async def get_user_stats(
 
 
 async def build_top(session: AsyncSession, sort: str, period: str) -> str:
+    if sort not in METRICS:
+        raise ValueError("Неизвестная категория рейтинга.")
     start, end, label = period_bounds(period)
+    title = f"🏆 <b>Рейтинг · {escape_html(METRICS[sort])}</b>\n{escape_html(label)}"
     users = await user_pivot(session, start, end)
     days = await user_days(session, start, end)
     if not users:
-        return f"🏆 <b>Рейтинг</b>\n{escape_html(label)}\n\nПока нет активности."
+        return title + "\n\nПока нет активности."
 
     def metric(uid, user, active_days):
         if sort == "days":
@@ -1272,7 +1276,7 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
 
     users = {uid: user for uid, user in users.items() if metric(uid, user, days) > 0}
     if not users:
-        return f"🏆 <b>Рейтинг</b>\n{escape_html(label)}\n\nПока нет активности в этой категории."
+        return title + "\n\nПока нет активности в этой категории."
     current = sorted(users.items(), key=sort_key, reverse=True)[:10]
     arrows: dict[int, str] = {}
     if period in {"7d", "30d"}:
@@ -1298,20 +1302,21 @@ async def build_top(session: AsyncSession, sort: str, period: str) -> str:
             prev = prev_rank.get(uid)
             arrows[uid] = "новый" if prev is None else f"↑{prev - idx}" if prev > idx else f"↓{idx - prev}" if prev < idx else ""
 
-    labels = {
-        "total": "Вся активность", "messages": "Сообщения",
-        "loops": "Лупы", "zips": "Архивы", "files": "Файлы",
-        "media": "Медиа", "days": "Активные дни", "opportunities": "Возможности", "contribution": "По вкладу",
-    }
-    out = f"🏆 <b>Рейтинг</b>\n{escape_html(labels.get(sort, sort))} · {escape_html(label)}\n\n"
+    out = title + "\n"
     for idx, (uid, user) in enumerate(current, start=1):
         marker = ("🥇", "🥈", "🥉")[idx - 1] if idx <= 3 else f"{idx}."
         name = escape_html(short(display_name(user["un"], user["fn"]), 36))
         value = metric(uid, user, days)
         shown = number(int(value)) if value == int(value) else f"{value:g}".replace(".", ",")
-        unit = " баллов" if sort == "contribution" else " дн." if sort == "days" else ""
+        nouns = {"total": ("действие", "действия", "действий"),
+                 "messages": ("сообщение", "сообщения", "сообщений"),
+                 "loops": ("луп", "лупа", "лупов"), "zips": ("архив", "архива", "архивов"),
+                 "files": ("файл", "файла", "файлов"), "media": ("медиа", "медиа", "медиа"),
+                 "days": ("день", "дня", "дней"), "opportunities": ("возможность", "возможности", "возможностей"),
+                 "contribution": ("балл", "балла", "баллов")}
+        unit = " " + (plural(int(value), *nouns[sort]) if value == int(value) else "балла")
         change = f" · {arrows[uid]}" if arrows.get(uid) else ""
-        out += f"{marker} <b>{name}</b>\n{shown}{unit}{change}\n\n"
+        out += f"\n{marker} <b>{name}</b>\n<b>{shown}</b>{unit}{change}\n"
     return out.rstrip()
 
 
@@ -1744,11 +1749,13 @@ async def cmd_setreport(message: Message, session: AsyncSession):
             "❗ Ответь /setreport на сообщение именно в том чате/топике, куда должен идти отчёт."
         )
         return
-    await session.merge(Setting(key="report_chat", value=str(message.chat.id)))
-    await session.merge(
-        Setting(key="report_thread", value=str(message.reply_to_message.message_thread_id or 0))
-    )
-    await session.commit()
+    async with user_write_lock(-3):
+        await session.commit()
+        await session.merge(Setting(key="report_chat", value=str(message.chat.id)))
+        await session.merge(
+            Setting(key="report_thread", value=str(message.reply_to_message.message_thread_id or 0))
+        )
+        await session.commit()
     await message.answer(f"✅ Отчёт настроен: каждый понедельник в 12:00 по {BOT_TIMEZONE}.")
 
 
@@ -2168,6 +2175,10 @@ register_ui(router, sys.modules[__name__])
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        with single_instance(Path(__file__).resolve().with_name(".trackerbot.lock")):
+            asyncio.run(main())
+    except AlreadyRunning:
+        log.error("Бот уже запущен. Второй экземпляр не запущен, чтобы не мешать обработке сообщений.")
+        raise SystemExit(1) from None
     except KeyboardInterrupt:
         log.info("Bot stopped")

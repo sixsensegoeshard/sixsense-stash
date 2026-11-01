@@ -125,11 +125,11 @@ class UITests(unittest.IsolatedAsyncioTestCase):
     async def test_start_and_period_navigation_edit_one_message(self):
         home = await self.command("/start")
         self.assertIn("301 / TRACKER", home.text)
-        stats = await self.click(home, "Моя активность")
+        stats = await self.click(home, "Активность")
         self.assertEqual(stats.message_id, home.message_id)
         changed = await self.click(stats, "7 дней")
         self.assertIn("последние 7 дней", changed.text)
-        selected = [b for row in changed.reply_markup.inline_keyboard for b in row if b.text == "✓ 7 дней"]
+        selected = [b for row in changed.reply_markup.inline_keyboard for b in row if b.text == "7 дней"]
         self.assertEqual(selected[0].style, "primary")
         self.assertEqual(changed.message_id, home.message_id)
         self.assertTrue(any(isinstance(call, AnswerCallbackQuery) for call in self.api.calls))
@@ -296,6 +296,18 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             top = await build_screen(app, session, 900, "top", extra="loops")
             self.assertIn("нет активности в этой категории", top.text)
 
+    async def test_recent_messages_match_statistics_scope_and_exclude_future(self):
+        async with self.sessions() as session:
+            for chat, stamp, text in ((app.TRACK_CHAT_ID, app.utc_now() - timedelta(minutes=1), "Visible message"),
+                                      (app.TRACK_CHAT_ID, app.utc_now() + timedelta(days=1), "Future message"),
+                                      (-999, app.utc_now() - timedelta(minutes=1), "Foreign message")):
+                session.add(app.MsgLog(user_id=10, chat_id=chat, category="message", created_at=stamp, text_preview=text))
+            await session.commit()
+            screen = await build_screen(app, session, 900, "last", 10)
+            self.assertIn("Visible message", screen.text)
+            self.assertNotIn("Future message", screen.text)
+            self.assertNotIn("Foreign message", screen.text)
+
     async def test_regular_users_see_only_four_commands(self):
         api_bot = AsyncMock()
         await app.setup_commands(api_bot)
@@ -310,7 +322,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 session.add(app.Placement(user_id=10, tier="small", actor_id=900, created_at=app.utc_now() - timedelta(minutes=1)))
             await session.commit()
         profile = await self.command("/profile @artist")
-        roles = await self.click(profile, "Прогресс")
+        roles = await self.click(profile, "Роли")
         preview = await self.click(roles, "Подтвердить Small")
         await self.click(preview, "Подтвердить")
         async with self.sessions() as session:
@@ -400,7 +412,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
         notes = await self.command("/notes @artist")
         detail = await self.click(notes, "Открыть")
-        await self.click(detail, "Исправить текст")
+        await self.click(detail, "Текст")
         preview = await self.command("corrected <text>")
         async with self.sessions() as session:
             self.assertEqual((await session.scalar(select(app.Note))).text, "original")
@@ -447,7 +459,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             session.add(app.Note(user_id=10, actor_id=900, text="original", created_at=app.utc_now()))
             await session.commit()
         detail = await self.click(await self.command("/notes @artist"), "Открыть")
-        await self.click(detail, "Исправить текст")
+        await self.click(detail, "Текст")
         preview = await self.command("stale correction")
         async with self.sessions() as session:
             note = await session.scalar(select(app.Note))
@@ -647,8 +659,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         choices = await self.click(by_files, "Категория")
         back = await self.click(choices, "‹ Рейтинг")
         selected = [b.text for row in back.reply_markup.inline_keyboard for b in row]
-        self.assertIn("✓ 7 дней", selected)
-        self.assertIn("Категория · Файлы", selected)
+        self.assertIn("7 дней", selected)
+        self.assertIn("⚙️ Категория", selected)
+        self.assertIn("Рейтинг · Файлы", back.text)
 
     async def test_polished_screens_have_compact_keyboards_and_single_navigation_row(self):
         async with self.sessions() as session:
