@@ -122,15 +122,18 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_update(self.telegram, update)
         return self.last_screen()
 
-    async def test_statistics_has_only_month_and_csv_buttons(self):
+    async def test_statistics_has_month_csv_and_menu_buttons(self):
         home = await self.command("/start")
         stats = await self.click(home, "Статистика")
         self.assertEqual(stats.message_id, home.message_id)
-        self.assertEqual([b.text for row in stats.reply_markup.inline_keyboard for b in row], ["Месяц", "Всё время"])
+        self.assertEqual([[b.text for b in row] for row in stats.reply_markup.inline_keyboard], [["Месяц", "Всё время"], ["Меню"]])
         changed = await self.click(stats, "Месяц")
         self.assertEqual(changed.message_id, home.message_id)
         await self.click(changed, "Всё время")
         self.assertTrue(any(isinstance(call, SendDocument) for call in self.api.calls))
+        returned = await self.click(changed, "Меню")
+        self.assertEqual(returned.message_id, home.message_id)
+        self.assertIn("301 / TRACKER", returned.text)
 
     async def test_stats_without_arguments_returns_own_card(self):
         stats = await self.command("/stats", actor=10)
@@ -666,7 +669,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 screen = await build_screen(app, session, 900, view, 10, extra=extra)
                 self.assertTrue(all(len(row) <= 2 for row in screen.markup.inline_keyboard), view)
                 self.assertEqual(sum(parse_payload(b.callback_data)[1] == "home"
-                                     for row in screen.markup.inline_keyboard for b in row), 0 if view == "stats" else 1, view)
+                                     for row in screen.markup.inline_keyboard for b in row), 1, view)
 
     async def test_group_menu_goes_to_private_chat(self):
         result = await self.command("/menu", chat_id=app.TRACK_CHAT_ID)

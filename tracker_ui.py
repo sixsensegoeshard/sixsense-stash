@@ -663,6 +663,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         parents[view] = ("‹ Роли группы", "board", 0, extra[2:])
     if view == "profile" and admin and uid != owner:
         parents[view] = ("‹ Участники", "members", 0, directory_extra)
+    if view == "stats":
+        rows += [[button(owner, "Меню", "home")]]
     if view not in {"home", "stats"}:
         parent = parents.get(view)
         navigation = [button(owner, parent[0], parent[1], parent[2], period, parent[3])] if parent else []

@@ -539,7 +539,7 @@ class NavigationAuditTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_period_buttons_normalize_to_current_calendar_month(self):
         stats = await self.show("stats", period="7d")
         self.assertNotIn("последние 7 дней", stats.text)
-        self.assertEqual([b.text for b in self.buttons(stats)], ["Месяц", "Всё время"])
+        self.assertEqual([b.text for b in self.buttons(stats)], ["Месяц", "Всё время", "Меню"])
         returned = await self.tap(stats, "stats")
         self.assertEqual(stats.text, returned.text)
 
