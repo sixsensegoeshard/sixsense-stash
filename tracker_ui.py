@@ -330,14 +330,13 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                 text += "\n\nНовые сообщения в группе появятся здесь автоматически."
             rows = [[button(owner, "🏆 Активность", "top", extra="total"), button(owner, "🎯 Плейсменты", "placetop")],
                     [button(owner, "📊 Статистика", "stats", owner), button(owner, "👥 Участники", "members")],
-                    [button(owner, "⚙️ Управление", "admin"), button(owner, "💡 Помощь", "help")]]
+                    [button(owner, "⚙️ Управление", "admin")]]
         else:
             s = await app.get_user_stats(session, owner, "month")
             text += f"\n{escape(short(name, 36))}\n\n" + metric_panel(summary(s['total'], s['active_days']))
             if not s['total']:
                 text += "\n\nОтправь сообщение или луп в группу — здесь появится твоя активность."
-            rows = [[button(owner, "📊 Активность", "stats", owner, style="primary"), button(owner, "👤 Профиль", "profile", owner)],
-                    [button(owner, "💡 Помощь", "help")]]
+            rows = [[button(owner, "📊 Активность", "stats", owner, style="primary"), button(owner, "👤 Профиль", "profile", owner)]]
     elif view == "stats":
         s = await app.get_user_stats(session, uid, period)
         s["streak"] = min(s["streak"], s["active_days"])
