@@ -56,7 +56,7 @@ class MonthlyReportsTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def placement(session, uid=10, stamp=None, **values):
-        values.setdefault("username", "winner")
+        values.setdefault("username", "@winner")
         values.setdefault("tier", "small")
         values.setdefault("artist", "@primary")
         values.setdefault("track", "Трек 🎵")
@@ -75,6 +75,13 @@ class MonthlyReportsTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def archive(session, uid=10, period="2026-09", **values):
         session.add(app.MonthlySnapshot(user_id=uid, period=period, **values))
+
+    async def test_plain_display_names_are_never_invented_as_handles(self):
+        async with self.sessions() as session:
+            self.placement(session, username="John")
+            await session.commit()
+            row = self.rows(await placements_csv(app, session, 10))[0]
+            self.assertEqual(row["winner"], "John")
 
     async def test_empty_csvs_have_bom_and_personal_current_zero_row(self):
         async with self.sessions() as session:

@@ -79,7 +79,7 @@ def _group(app):
 def _handle(value):
     """Normalize stored handles without treating display names as usernames."""
     value = str(value or "").strip()
-    if value and re.fullmatch(r"@*[A-Za-z0-9_]+", value):
+    if value.startswith("@") and re.fullmatch(r"@+[A-Za-z0-9_]+", value):
         return "@" + value.lstrip("@")
     return value
 
@@ -131,7 +131,7 @@ async def _names(app, session, ids, now):
     ).order_by(snapshot.period.desc(), snapshot.id.desc()))).all()
     for uid, username, period in archives:
         if _valid_period(period) and username:
-            names.setdefault(uid, _handle(username))
+            names.setdefault(uid, _handle("@" + username.lstrip("@")))
     for model in (app.Placement, app.Note):
         manual = (await session.execute(select(model.user_id, model.username).where(
             model.user_id.in_(ids), model.created_at < now, model.username.is_not(None),
