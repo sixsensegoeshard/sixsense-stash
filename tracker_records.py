@@ -57,6 +57,15 @@ def _validated_text(text: str | None, label: str) -> str:
 def parse_placement(text: str) -> dict:
     """Shared placement parser; matches the existing entry form's validation."""
     text = _validated_text(text, "описание")
+    collaborators = None
+    if text.count("|") >= 2 and text.rsplit("|", 1)[1].strip().startswith("@"):
+        head, collaborators = text.rsplit("|", 1)
+        handles = collaborators.replace(",", " ").split()
+        import re
+        if not handles or len(handles) > 15 or any(not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", h) for h in handles):
+            raise ValueError("Укажи участников продакшена через @username (до 15 человек).")
+        collaborators = " ".join(dict.fromkeys(handles))
+        text = head.strip()
     artist = track = None
     for separator in ("|", " — ", " - "):
         if separator in text:
@@ -66,7 +75,10 @@ def parse_placement(text: str) -> dict:
                     "Укажи артиста и трек (до 200 символов каждый): Артист | Трек."
                 )
             break
-    return {"artist": artist, "track": track, "comment": None if artist else text}
+    result = {"artist": artist, "track": track, "comment": None if artist else text}
+    if collaborators is not None:
+        result["collaborators"] = collaborators
+    return result
 
 
 async def load_record(app, session, uid: int, kind: str, record_id: int):
@@ -118,6 +130,8 @@ async def modify_record(
             if tier not in {"small", "large"}:
                 raise ValueError("Выбери уровень плейсмента: Small или Big.")
             values = {**parse_placement(text), "tier": tier}
+            if hasattr(app.Placement, "collaborators"):
+                values.setdefault("collaborators", None)
 
     async with app.user_write_lock(uid):
         await session.commit()
@@ -176,6 +190,8 @@ def _restore_values(app, change) -> dict:
     fields = {field.key for field in inspect(model).column_attrs}
     try:
         snapshot = json.loads(change.before_json)
+        if change.record_kind == "place" and isinstance(snapshot, dict) and "collaborators" in fields:
+            snapshot.setdefault("collaborators", None)
         if (
             not isinstance(snapshot, dict) or set(snapshot) != fields
             or type(snapshot["id"]) is not int

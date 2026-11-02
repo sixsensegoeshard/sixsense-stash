@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
 import re
@@ -187,6 +188,7 @@ class Placement(Base):
     track: Mapped[str | None] = mapped_column(String)
     comment: Mapped[str | None] = mapped_column(String)
     proof: Mapped[str | None] = mapped_column(String)
+    collaborators: Mapped[str | None] = mapped_column(String)
     actor_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     used_by_award_id: Mapped[int | None] = mapped_column(Integer, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
@@ -244,6 +246,19 @@ class RoleAward(Base):
     small_count: Mapped[int] = mapped_column(Integer, default=0)
     large_count: Mapped[int] = mapped_column(Integer, default=0)
     note: Mapped[str | None] = mapped_column(String)
+    evidence_json: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class ActivityRoleAward(Base):
+    """Admin-confirmed activity roles with the exact month and stats at award."""
+    __tablename__ = "activity_role_awards"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    role: Mapped[str] = mapped_column(String)
+    period: Mapped[str] = mapped_column(String, index=True)
+    stats_json: Mapped[str] = mapped_column(String)
+    actor_id: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
@@ -542,6 +557,8 @@ async def init_db() -> None:
         await ensure_column(conn, "placements", "artist", "VARCHAR")
         await ensure_column(conn, "placements", "track", "VARCHAR")
         await ensure_column(conn, "placements", "proof", "VARCHAR")
+        await ensure_column(conn, "placements", "collaborators", "VARCHAR")
+        await ensure_column(conn, "role_awards", "evidence_json", "VARCHAR")
         await ensure_column(conn, "placements", "actor_id", "BIGINT")
         await ensure_column(conn, "placements", "used_by_award_id", "INTEGER")
         await ensure_column(conn, "notes", "actor_id", "BIGINT")
@@ -1191,6 +1208,17 @@ async def _reset_placement_progress(
     state = await get_or_create_placement_progress(session, uid)
     now = utc_now()
     p_before = await placement_progress(session, uid)
+    reset_at = state.small_reset_at if kind == "small" else state.big_reset_at
+    evidence_query = select(Placement).where(
+        Placement.user_id == uid, Placement.tier == ("small" if kind == "small" else "large"),
+        Placement.created_at < now,
+    )
+    if reset_at:
+        evidence_query = evidence_query.where(Placement.created_at > reset_at)
+    evidence = [{"id": item.id, "artist": item.artist, "track": item.track,
+                 "winner": item.username or name, "collaborators": item.collaborators or "",
+                 "created_at": item.created_at.isoformat()}
+                for item in (await session.scalars(evidence_query.order_by(Placement.id))).all()]
 
     if kind == "small":
         state.small_reset_at = now
@@ -1207,6 +1235,7 @@ async def _reset_placement_progress(
             small_count=p_before["small"],
             large_count=p_before["large"],
             note=f"manual role confirm + {kind} progress reset",
+            evidence_json=json.dumps(evidence, ensure_ascii=False),
             created_at=now,
         )
     )
@@ -1434,69 +1463,8 @@ async def make_snapshot(session: AsyncSession) -> str:
 
 
 async def build_export(session: AsyncSession) -> BufferedInputFile:
-    users = await user_pivot(session, None, utc_now())
-    days = await user_days(session, None, utc_now())
-    from tracker_insights import member_directory
-    directory = await member_directory(sys.modules[__name__], session, page_size=2**31 - 1)
-    for member in directory["items"]:
-        users.setdefault(member["uid"], _blank_user())
-    for uid, user in users.items():
-        profile = await session.get(User, uid)
-        if profile:
-            user.update(un=profile.username, fn=profile.first_name)
-        elif not user["un"] and not user["fn"]:
-            user["un"] = await resolve_name(session, uid)
-
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(
-        [
-            "user_id",
-            "username",
-            "first_name",
-            "messages",
-            "loops",
-            "zips",
-            "files",
-            "photo_video",
-            "opportunities",
-            "total",
-            "active_days",
-            "small_placements",
-            "large_placements",
-            "total_placements",
-            "small_progress",
-            "big_progress",
-            "role_ready",
-        ]
-    )
-    for uid, user in sorted(users.items(), key=lambda item: item[1]["total"], reverse=True):
-        p = await placement_progress(session, uid)
-        writer.writerow(
-            [
-                uid,
-                safe_csv_cell(user["un"] or ""),
-                safe_csv_cell(user["fn"] or ""),
-                user["messages"],
-                user["loops"],
-                user["zips"],
-                user["files"],
-                user["media"],
-                user["opportunities"],
-                user["total"],
-                days.get(uid, 0),
-                p["small"],
-                p["large"],
-                p["total"],
-                p["small_since"],
-                p["large_since"],
-                int(p["ready"]),
-            ]
-        )
-    return BufferedInputFile(
-        buffer.getvalue().encode("utf-8-sig"),
-        filename=f"301tracker_{local_now():%Y-%m-%d}.csv",
-    )
+    from tracker_monthly import activity_csv
+    return await activity_csv(sys.modules[__name__], session)
 
 
 def safe_csv_cell(value: str) -> str:
@@ -1555,6 +1523,10 @@ async def cmd_my(message: Message, session: AsyncSession, command: CommandObject
     period = command.args.split()[-1].lower() if command.args else "month"
     if period not in PERIOD_KEYS:
         period = "month"
+    if period == "all":
+        from tracker_monthly import activity_csv
+        await send_document_private_or_ack(message, bot, await activity_csv(sys.modules[__name__], session, message.from_user.id), "Активность по месяцам · CSV")
+        return
     await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "stats", message.from_user.id, period), bot)
 
 
@@ -1575,6 +1547,10 @@ async def cmd_stats(message: Message, session: AsyncSession, command: CommandObj
     if error:
         await message.answer(error)
         return
+    if period == "all":
+        from tracker_monthly import activity_csv
+        await send_document_private_or_ack(message, bot, await activity_csv(sys.modules[__name__], session, uid), "Активность по месяцам · CSV")
+        return
     await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "stats", uid, period), bot)
 
 
@@ -1592,6 +1568,9 @@ async def cmd_top(message: Message, session: AsyncSession, command: CommandObjec
             period = t
         elif t in SORT_KEYS:
             sort = t
+    if period == "all":
+        await send_document_private_or_ack(message, bot, await build_export(session), "Активность и роли по месяцам · CSV")
+        return
     await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "top", period=period, extra=sort), bot)
 
 
@@ -1652,7 +1631,8 @@ async def cmd_history(message: Message, session: AsyncSession, command: CommandO
     if error:
         await message.answer(error)
         return
-    await deliver(message, await build_screen(sys.modules[__name__], session, message.from_user.id, "history", uid), bot)
+    from tracker_monthly import activity_csv
+    await send_document_private_or_ack(message, bot, await activity_csv(sys.modules[__name__], session, uid), "Активность по месяцам · CSV")
 
 
 @router.message(Command("roles"))
@@ -1726,7 +1706,7 @@ async def cmd_export(message: Message, session: AsyncSession, bot: Bot):
     if not is_admin(message):
         return
     await send_document_private_or_ack(
-        message, bot, await build_export(session), "📤 Full tracker export"
+        message, bot, await build_export(session), "Активность и роли по месяцам · CSV"
     )
 
 
@@ -1875,6 +1855,9 @@ async def retention_cleanup(session: AsyncSession) -> int:
     async with user_write_lock(-2):
         await session.commit()
         try:
+            from tracker_monthly import ensure_month_archives
+            await ensure_month_archives(sys.modules[__name__], session)
+            await session.flush()
             previous_start, current_start, previous_period = previous_calendar_month_range()
             week_start, _, _ = previous_calendar_week_range()
             # Keep the current month's source and the full week displayed by
@@ -1904,6 +1887,10 @@ async def retention_cleanup(session: AsyncSession) -> int:
 
 async def startup_catchup(bot: Bot) -> None:
     async with Session() as session:
+        from tracker_monthly import ensure_month_archives
+        async with user_write_lock(-2):
+            await ensure_month_archives(sys.modules[__name__], session)
+            await session.commit()
         now_local = local_now()
         if now_local.day == 1 and now_local.hour == 0 and now_local.minute < 5:
             pass

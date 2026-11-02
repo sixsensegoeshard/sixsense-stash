@@ -35,7 +35,21 @@ FORM_TTL = 15 * 60
 def entry_body(item, kind: str) -> str:
     if kind == "note":
         return item.text or ""
-    return item.comment or f"{item.artist or '—'} | {item.track or '—'}"
+    body = item.comment or f"{item.artist or '—'} | {item.track or '—'}"
+    return body + (f" | {item.collaborators}" if getattr(item, "collaborators", None) else "")
+
+
+def activity_role_input(value: str, current: str) -> tuple[str, str]:
+    import re
+    role, separator, period = value.rpartition("|")
+    if not separator:
+        role, period = value, current
+    role, period = role.strip(), period.strip()
+    if not role or len(role) > 100 or "\n" in role:
+        raise ValueError("Название роли — от 1 до 100 символов в одной строке.")
+    if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", period) or period > current:
+        raise ValueError("Укажи существующий месяц в формате ГГГГ-ММ, не позднее текущего.")
+    return role, period
 
 
 def record_key(kind: str, record_id: int, version: str = "") -> str:
@@ -255,8 +269,9 @@ def roles_card(name: str, p: dict) -> str:
 def help_card(admin: bool) -> str:
     text = (
         "💡 <b>Помощь</b>\n\n"
-        "<b>Активность</b>\nСообщения и вложения за выбранный период.\n\n"
+        "<b>Активность</b>\nСообщения и вложения за текущий календарный месяц.\nПервого числа счёт начинается заново; история остаётся в CSV.\n\n"
         "<b>Профиль</b>\nПлейсменты и прогресс к следующей роли.\n\n"
+        "«Месяц» — статистика в боте. «Всё время» — CSV по месяцам.\n\n"
         "Бот учитывает новые сообщения в подключённой группе. "
         "Старая переписка автоматически не загружается.\n\n"
         "<code>/menu</code> — меню · <code>/cancel</code> — отмена ввода."
@@ -291,6 +306,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
     """Render bounded screens; permission checks also cover direct callers."""
     admin = owner in app.ADMIN_IDS
     uid = uid or owner
+    if view in {"stats", "top"}:
+        period = "month"
     if period not in PERIODS:
         raise ValueError("Unknown period")
     personal = {"stats", "profile", "places", "roles", "history", "rec"}
@@ -311,8 +328,8 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
             text += "\n\n" + metric_panel(f"<b>Активность группы</b>\n{totals}")
             if not total:
                 text += "\n\nНовые сообщения в группе появятся здесь автоматически."
-            rows = [[button(owner, "👥 Участники", "members", style="primary"), button(owner, "🏆 Рейтинг", "top", extra="total")],
-                    [button(owner, "📊 Активность", "stats", owner), button(owner, "👤 Профиль", "profile", owner)],
+            rows = [[button(owner, "🏆 Активность", "top", extra="total"), button(owner, "🎯 Плейсменты", "placetop")],
+                    [button(owner, "📊 Статистика", "stats", owner), button(owner, "👥 Участники", "members")],
                     [button(owner, "⚙️ Управление", "admin"), button(owner, "💡 Помощь", "help")]]
         else:
             s = await app.get_user_stats(session, owner, "month")
@@ -323,17 +340,10 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
                     [button(owner, "💡 Помощь", "help")]]
     elif view == "stats":
         s = await app.get_user_stats(session, uid, period)
+        s["streak"] = min(s["streak"], s["active_days"])
         text = stats_card(name, s)
-        comparison = await activity_comparison(app, session, uid, period)
-        if comparison and comparison["previous"] and comparison["delta"]:
-            current, previous = comparison["current"], comparison["previous"]
-            delta = current - previous
-            percent = comparison["percent"]
-            percent_text = f"{percent:+.0f}%" if abs(percent) >= 1 else f"{percent:+.1f}%".replace(".", ",")
-            comparison_label = {"7d": "к предыдущим 7 дням", "30d": "к предыдущим 30 дням",
-                                "month": "к тому же периоду прошлого месяца"}[period]
-            text += f"\n\n{'↗' if delta > 0 else '↘'} <b>{percent_text}</b> {comparison_label}"
-        rows = period_buttons(owner, view, uid, period)
+        rows = [[button(owner, "Месяц", "stats", uid, style="primary"),
+                 button(owner, "Всё время", "archive", uid, extra="activity")]]
     elif view == "profile":
         month = await app.get_user_stats(session, uid, "month")
         p = await app.placement_progress(session, uid)
@@ -356,13 +366,14 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         activity_actions = [button(owner, "📊 Активность", "stats", uid, period)]
         has_archive = bool(await session.scalar(select(app.MonthlySnapshot.id).where(app.MonthlySnapshot.user_id == uid).limit(1)))
         if has_messages or has_archive:
-            activity_actions.append(button(owner, "🗓 По месяцам", "history", uid))
+            activity_actions.append(button(owner, "Всё время · CSV", "archive", uid, extra="activity"))
         rows = [role_actions, activity_actions]
         if admin:
             rows += [[button(owner, "＋ Плейсмент", "addplace", uid), button(owner, "Ещё", "more", uid)]]
     elif view == "more":
         text = card_title("Действия с профилем", name)
-        rows = [[button(owner, "＋ Заметка", "addnote", uid)]]
+        rows = [[button(owner, "＋ Заметка", "addnote", uid)],
+                [button(owner, "Роль за активность", "activityrole", uid)]]
         if await session.scalar(select(app.Note.id).where(app.Note.user_id == uid).limit(1)):
             rows += [[button(owner, "Заметки", "notes", uid)]]
         activity_where = (app.MsgLog.user_id == uid) & (app.MsgLog.created_at < app.utc_now())
@@ -520,10 +531,29 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         if extra not in METRICS:
             raise ValueError("Unknown metric")
         text = await app.build_top(session, extra, period)
-        rows = period_buttons(owner, view, 0, period, extra)
-        rows += [[button(owner, "⚙️ Категория", "metrics", period=period, extra=extra)]]
-        if extra == "contribution":
-            rows += [[button(owner, "Как считаются баллы", "scoring", period=period, extra=extra)]]
+        rows = [[button(owner, "Месяц", "top", extra=extra, style="primary"),
+                 button(owner, "Всё время", "archive", extra="activity")]]
+    elif view == "placetop":
+        from tracker_monthly import placement_month_rows
+        entries = await placement_month_rows(app, session)
+        pages = max(1, math.ceil(len(entries) / PAGE_SIZE))
+        page = max(0, min(int(extra), pages - 1))
+        text = card_title("Плейсменты · лидерборд", app.current_month_label()) + "\n"
+        if not entries:
+            text += "\nВ этом месяце пока нет плейсментов."
+        for idx, member in enumerate(entries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page * PAGE_SIZE + 1):
+            text += f"\n<b>{idx}. {escape(short(member['name'], 36))}</b> · {member['count']}\n"
+            for item in member["items"][:3]:
+                text += f"{escape(short(item.artist or 'Артист не указан', 45))} · {escape(short(item.track or item.comment or 'Плейсмент', 60))}\n"
+                if item.collaborators:
+                    text += f"На проде: {escape(short(item.collaborators, 100))}\n"
+            if member["count"] > 3:
+                text += f"Ещё {member['count'] - 3} — в профиле.\n"
+            rows += [[button(owner, short(member["name"], 32), "profile", member["uid"])]]
+        rows.insert(0, [button(owner, "Месяц", "placetop", style="primary"),
+                        button(owner, "Всё время", "archive", extra="placeroles")])
+        if nav := pager(owner, view, 0, page, pages):
+            rows += [nav]
     elif view == "scoring":
         text = ("<b>Баллы вклада</b>\n<i>Объём участия в группе</i>\n\n"
                 "Луп — <b>3</b>\nАрхив — <b>2</b>\nФайл — <b>1,5</b>\n"
@@ -633,7 +663,7 @@ async def build_screen(app, session, owner: int, view: str = "home", uid: int = 
         parents[view] = ("‹ Роли группы", "board", 0, extra[2:])
     if view == "profile" and admin and uid != owner:
         parents[view] = ("‹ Участники", "members", 0, directory_extra)
-    if view != "home":
+    if view not in {"home", "stats"}:
         parent = parents.get(view)
         navigation = [button(owner, parent[0], parent[1], parent[2], period, parent[3])] if parent else []
         navigation += [button(owner, "⌂ Меню", "home")]
@@ -718,6 +748,19 @@ async def _save_entry(app, session, actor: int, data: dict) -> str:
         await session.commit()
         return "Автоотчёт выключен."
     uid = data["uid"]
+    if data["kind"] == "activityrole":
+        role, period = activity_role_input(data["text"], app.local_now().strftime("%Y-%m"))
+        existing = await session.scalar(select(app.ActivityRoleAward.id).where(
+            app.ActivityRoleAward.user_id == uid, app.ActivityRoleAward.role == role,
+            app.ActivityRoleAward.period == period))
+        if existing:
+            return "Эта роль за этот месяц уже отмечена."
+        history = await monthly_history(app, session, uid)
+        stats = next((row for row in history if row["period"] == period), None)
+        session.add(app.ActivityRoleAward(user_id=uid, role=role, period=period,
+                    stats_json=json.dumps(stats, ensure_ascii=False), actor_id=actor, created_at=app.utc_now()))
+        await session.commit()
+        return "Роль за активность отмечена в истории."
     name = await app.resolve_name(session, uid) or f"ID {uid}"
     if data["kind"] == "note":
         model = app.Note
@@ -744,6 +787,10 @@ def confirmation_text(app, data: dict) -> str:
     if data["kind"] in {"undo", "snapshot", "restore", "reportoff"}:
         return data["text"]
     name = escape(short(data["name"], 48))
+    if data["kind"] == "activityrole":
+        role, period = activity_role_input(data["text"], app.local_now().strftime("%Y-%m"))
+        return (f"<b>Отметить выданную роль за активность?</b>\n{name}\n\n"
+                f"Роль: {escape(role)}\nМесяц: {escape(period)}\n\nЗапись попадёт в CSV. Права в Telegram не меняются.")
     if data["kind"] in {"edit", "delete"}:
         title = "Удалить запись?" if data["kind"] == "delete" else "Сохранить исправление?"
         text = f"<b>{title}</b>\n{name}\n\n<b>Сейчас</b>\n{escape(data['original'])}"
@@ -799,7 +846,7 @@ def register_ui(parent: Router, app) -> None:
         if not isinstance(query.message, Message) or query.message.chat.type != "private":
             await query.answer("Открой /menu в личном чате с ботом.", show_alert=True)
             return
-        personal = {"home", "help", "rules", "stats", "profile", "places", "roles", "history", "rec"}
+        personal = {"home", "help", "rules", "stats", "profile", "places", "roles", "history", "rec", "archive"}
         if owner not in app.ADMIN_IDS and (action not in personal or (uid and uid != owner)):
             await query.answer("Этот раздел доступен только администратору.", show_alert=True)
             return
@@ -810,6 +857,16 @@ def register_ui(parent: Router, app) -> None:
                 await query.answer("Этот поиск уже завершён. Открой участников и повтори поиск.", show_alert=True)
                 return
         await query.answer()
+        if action in {"archive", "history"}:
+            from tracker_monthly import activity_csv, placement_roles_csv
+            if extra not in {"activity", "placeroles", "0"}:
+                return
+            await state.clear()
+            target = (uid or None) if owner in app.ADMIN_IDS else owner
+            report = placement_roles_csv if extra == "placeroles" else activity_csv
+            document = await report(app, session, target)
+            await query.message.answer_document(document, caption="История за всё время · CSV по месяцам")
+            return
         if action == "cancel":
             data = await state.get_data()
             if data.get("nonce") != extra:
@@ -875,6 +932,17 @@ def register_ui(parent: Router, app) -> None:
         previous = await state.get_data()
         await state.clear()
         await state.set_data(directory_context(previous))
+        if action == "activityrole":
+            nonce = secrets.token_hex(4)
+            await state.set_state(Entry.details)
+            await state.update_data(kind="activityrole", uid=uid,
+                name=await app.resolve_name(session, uid) or f"ID {uid}", nonce=nonce,
+                started=app.utc_now().timestamp(), cancel_view="more", result_view="more")
+            await edit_screen(query, Screen("<b>Выданная роль за активность</b>\n\n"
+                "Отправь название роли и месяц:\n<code>Contributor | " + app.local_now().strftime("%Y-%m") + "</code>\n\n"
+                "Без месяца будет указан текущий. Сохраним после подтверждения.",
+                keyboard([[button(owner, "Отмена", "cancel", uid, extra=nonce)]])))
+            return
         if action in {"edt", "del", "tier"}:
             try:
                 kind, record_id, version = parse_record_key(extra)
@@ -965,7 +1033,7 @@ def register_ui(parent: Router, app) -> None:
             nonce = secrets.token_hex(4)
             await state.set_state(Entry.details)
             await state.update_data(kind=kind, tier=action, uid=uid, name=name, started=app.utc_now().timestamp(), nonce=nonce, cancel_view="profile")
-            prompt = "Отправь текст заметки (до 500 символов)." if kind == "note" else "Отправь артиста и трек:\n<code>Артист | Название трека</code>\n\nИли краткое описание (до 500 символов)."
+            prompt = "Отправь текст заметки (до 500 символов)." if kind == "note" else "Отправь артиста, трек и участников продакшена:\n<code>@artist | Название трека | @producer1 @producer2</code>\n\nПоследнюю часть можно пропустить. Плейсмент засчитывается человеку из открытого профиля. До 500 символов."
             step = "Шаг 1 из 2 · Текст" if kind == "note" else "Шаг 2 из 3 · Описание"
             await edit_screen(query, Screen(card_title("Новая заметка" if kind == "note" else "Новый плейсмент", name)
                 + f"\n\n<i>{step}</i>\n\n{prompt}", keyboard([[button(owner, "Отмена", "cancel", uid, extra=nonce)]])))
@@ -1067,6 +1135,9 @@ def register_ui(parent: Router, app) -> None:
                 raise ValueError("Отправь текст от 1 до 500 символов.")
             if data["kind"] == "place" or (data["kind"] == "edit" and data["record_kind"] == "place"):
                 parse_placement(value)
+            if data["kind"] == "activityrole":
+                role, month = activity_role_input(value, app.local_now().strftime("%Y-%m"))
+                value = f"{role} | {month}"
         except ValueError as exc:
             await message.answer(str(exc))
             return

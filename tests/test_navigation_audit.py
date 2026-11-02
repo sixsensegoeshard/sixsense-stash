@@ -536,13 +536,56 @@ class NavigationAuditTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("страница 2/2", returned.text,
                               "Completing a record form reset the source list page")
 
-    async def test_profile_round_trip_keeps_activity_period(self):
+    async def test_old_period_buttons_normalize_to_current_calendar_month(self):
         stats = await self.show("stats", period="7d")
-        profile = await self.tap(stats, "profile")
-        returned = await self.tap(profile, "stats")
-        self.assertIn("последние 7 дней", returned.text,
-                      "Profile's activity button discarded the selected period")
-        self.assertTrue(any(b.text == "7 дней" and b.style == "primary" for b in self.buttons(returned)))
+        self.assertNotIn("последние 7 дней", stats.text)
+        self.assertEqual([b.text for b in self.buttons(stats)], ["Месяц", "Всё время"])
+        returned = await self.tap(stats, "stats")
+        self.assertEqual(stats.text, returned.text)
+
+    async def test_activity_role_is_confirmed_once_for_an_explicit_month(self):
+        import json
+        more = await self.show("more", uid=10)
+        await self.tap(more, "activityrole")
+        preview = await self.type_text("Contributor | 2026-09")
+        self.assertIn("2026-09", preview.text)
+        self.assertEqual(await self.count(app.ActivityRoleAward), 0)
+        await self.tap(preview, "save")
+        await self.tap(preview, "save")
+        self.assertEqual(await self.count(app.ActivityRoleAward), 1)
+        async with self.sessions() as session:
+            award = await session.scalar(select(app.ActivityRoleAward))
+            self.assertEqual((award.user_id, award.role, award.period, award.actor_id),
+                             (10, "Contributor", "2026-09", 900))
+            self.assertIsNone(json.loads(award.stats_json))
+
+    async def test_placement_role_freezes_artists_and_collaborators(self):
+        import json
+        async with self.sessions() as session:
+            session.add(app.Placement(user_id=10, tier="large", username="@artist",
+                artist="@singer", track="Song", collaborators="@producer1 @producer2",
+                created_at=NOW - timedelta(minutes=1)))
+            await session.commit()
+        preview = await self.tap(await self.show("roles"), "awardbig")
+        await self.tap(preview, "save")
+        async with self.sessions() as session:
+            award = await session.scalar(select(app.RoleAward))
+            evidence = json.loads(award.evidence_json)
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["artist"], "@singer")
+            self.assertEqual(evidence[0]["collaborators"], "@producer1 @producer2")
+            self.assertEqual(evidence[0]["winner"], "@artist")
+
+    async def test_personal_archive_cannot_be_forged_into_group_csv(self):
+        from aiogram.methods import SendDocument
+        from tracker_ui import button
+        launch = await self.telegram.send_message(10, "Stats", reply_markup=__import__("tracker_ui").keyboard(
+            [[button(10, "Archive", "archive", 0, extra="activity")]]))
+        await self.tap(launch, "archive", actor=10)
+        doc = next(m for m in reversed(self.api.calls) if isinstance(m, SendDocument))
+        import csv, io
+        rows = list(csv.DictReader(io.StringIO(doc.document.data.decode("utf-8-sig"))))
+        self.assertEqual({r["user_id"] for r in rows}, {"10"})
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ async def generate(target: Path) -> None:
                 created_at=app.utc_now() - timedelta(hours=index * 2 + 1), text_preview="Новый луп · session 01"))
         for index in range(7):
             session.add(app.Placement(user_id=10, tier="small" if index % 3 else "large",
-                artist="Artist", track="Late Night", actor_id=900,
+                artist="@singer", track="Late Night", collaborators="@producer1 @producer2", actor_id=900,
                 created_at=app.utc_now() - timedelta(days=index), comment="Artist | Late Night"))
         session.add(app.Note(user_id=10, actor_id=900, text="Связаться по поводу следующего релиза.", created_at=app.utc_now()))
         for index in range(6):
@@ -83,7 +83,7 @@ async def generate(target: Path) -> None:
             cards.append(render("Сценарий со скриншота / тёмная · 320px", screenshot, True))
             cards.append(render("Сценарий со скриншота / светлая · 320px", screenshot))
         views = [("home", "0"), ("profile", "0"), ("stats", "0"), ("roles", "0"), ("places", "0"),
-                 ("more", "0"), ("members", "0"), ("top", "contribution"), ("metrics", "total"),
+                 ("more", "0"), ("members", "0"), ("placetop", "0"), ("top", "contribution"), ("metrics", "total"),
                  ("scoring", "contribution"), ("admin", "0"), ("board", "ready.0"), ("service", "0"),
                  ("health", "0"), ("reports", "0"), ("reportsetup", "0"), ("report", "0"),
                  ("help", "0"), ("rules", "0"), ("history", "0"), ("notes", "0"), ("last", "0"), ("changes", "0")]

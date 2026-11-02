@@ -122,17 +122,15 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_update(self.telegram, update)
         return self.last_screen()
 
-    async def test_start_and_period_navigation_edit_one_message(self):
+    async def test_statistics_has_only_month_and_csv_buttons(self):
         home = await self.command("/start")
-        self.assertIn("301 / TRACKER", home.text)
-        stats = await self.click(home, "Активность")
+        stats = await self.click(home, "Статистика")
         self.assertEqual(stats.message_id, home.message_id)
-        changed = await self.click(stats, "7 дней")
-        self.assertIn("последние 7 дней", changed.text)
-        selected = [b for row in changed.reply_markup.inline_keyboard for b in row if b.text == "7 дней"]
-        self.assertEqual(selected[0].style, "primary")
+        self.assertEqual([b.text for row in stats.reply_markup.inline_keyboard for b in row], ["Месяц", "Всё время"])
+        changed = await self.click(stats, "Месяц")
         self.assertEqual(changed.message_id, home.message_id)
-        self.assertTrue(any(isinstance(call, AnswerCallbackQuery) for call in self.api.calls))
+        await self.click(changed, "Всё время")
+        self.assertTrue(any(isinstance(call, SendDocument) for call in self.api.calls))
 
     async def test_stats_without_arguments_returns_own_card(self):
         stats = await self.command("/stats", actor=10)
@@ -148,7 +146,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 await session.commit()
                 screen = await build_screen(app, session, 900, "stats", 10)
                 self.assertIn("1</b> действие", screen.text)
-                self.assertIn("Серия · <b>2</b>", screen.text)
+                self.assertIn("Серия · <b>1</b>", screen.text)
                 self.assertNotIn("<i>", screen.text)
                 self.assertNotIn("Динамика", screen.text)
                 self.assertNotIn("Раньше активности", screen.text)
@@ -555,13 +553,13 @@ class UITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_csv_includes_note_only_members_and_escapes_names_as_data(self):
         async with self.sessions() as session:
-            await app.upsert_user(session, 10, "artist", "=formula")
+            await app.upsert_user(session, 10, None, "=formula")
             session.add(app.Note(user_id=777, username="@note_only", text="note", actor_id=900, created_at=app.utc_now()))
             await session.commit()
             exported = await app.build_export(session)
         rows = list(csv.DictReader(io.StringIO(exported.data.decode("utf-8-sig"))))
         self.assertIn("777", {row["user_id"] for row in rows})
-        self.assertEqual(next(row for row in rows if row["user_id"] == "10")["first_name"], "'=formula")
+        self.assertEqual(next(row for row in rows if row["user_id"] == "10")["name"], "'=formula")
 
     def test_record_callback_lengths_for_large_ids(self):
         from tracker_ui import record_key
@@ -651,17 +649,14 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Поиск:", result.text)
         self.assertIn("22 в базе", result.text)
 
-    async def test_ranking_category_picker_preserves_selected_period(self):
+    async def test_ranking_is_monthly_and_history_is_a_csv(self):
         ranking = await self.command("/top loops 7d")
-        categories = await self.click(ranking, "Категория")
-        by_files = await self.click(categories, "Файлы")
-        self.assertIn("последние 7 дней", by_files.text)
-        choices = await self.click(by_files, "Категория")
-        back = await self.click(choices, "‹ Рейтинг")
-        selected = [b.text for row in back.reply_markup.inline_keyboard for b in row]
-        self.assertIn("7 дней", selected)
-        self.assertIn("⚙️ Категория", selected)
-        self.assertIn("Рейтинг · Файлы", back.text)
+        self.assertNotIn("последние 7 дней", ranking.text)
+        labels = [b.text for row in ranking.reply_markup.inline_keyboard for b in row]
+        self.assertIn("Месяц", labels)
+        self.assertIn("Всё время", labels)
+        await self.click(ranking, "Всё время")
+        self.assertTrue(any(isinstance(call, SendDocument) for call in self.api.calls))
 
     async def test_polished_screens_have_compact_keyboards_and_single_navigation_row(self):
         async with self.sessions() as session:
@@ -671,7 +666,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 screen = await build_screen(app, session, 900, view, 10, extra=extra)
                 self.assertTrue(all(len(row) <= 2 for row in screen.markup.inline_keyboard), view)
                 self.assertEqual(sum(parse_payload(b.callback_data)[1] == "home"
-                                     for row in screen.markup.inline_keyboard for b in row), 1, view)
+                                     for row in screen.markup.inline_keyboard for b in row), 0 if view == "stats" else 1, view)
 
     async def test_group_menu_goes_to_private_chat(self):
         result = await self.command("/menu", chat_id=app.TRACK_CHAT_ID)
